@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Inter', sans-serif;
+    min-height: max(884px, 100vh);
+  }
+}
+
+@layer utilities {
+  .signature-texture {
+      background: linear-gradient(135deg, #153128 0%, #2c473e 100%);
+  }
+  .ambient-shadow {
+      box-shadow: 0 32px 64px -10px rgba(28, 28, 24, 0.05);
+  }
+  .ghost-border {
+      border: 1px solid rgba(193, 200, 196, 0.15);
+  }
+}

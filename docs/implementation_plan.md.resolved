@@ -1,0 +1,205 @@
+# Chuyển Pipeline từ MoveNet sang MediaPipe Pose
+
+Chuyển đổi toàn bộ pipeline trích xuất pose (17 keypoints 2D MoveNet) sang MediaPipe Pose Landmarker (33 keypoints 3D). Loại bỏ các đặc trưng khuôn mặt không cần thiết, giữ lại 23 keypoints liên quan đến cơ thể. Tận dụng tọa độ Z (chiều sâu) để tính toán góc khớp 3D chính xác hơn cho LSTM dự đoán điểm lâm sàng.
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Breaking Change**: Toàn bộ model `.keras` và scaler `.joblib` hiện tại sẽ **KHÔNG tương thích** với pipeline mới do số lượng features thay đổi hoàn toàn. Bạn cần **re-train** tất cả 5 model (Es1-Es5) sau khi chuyển sang MediaPipe.
+
+> [!WARNING]
+> **Data re-extraction**: Tất cả các file CSV trong `03_raw_joints/` (joint positions đã trích xuất bằng MoveNet) cần được chạy lại bằng script mới `01_extract_joint_positions.py` (MediaPipe) từ video gốc trong `01_raw_data/`.
+
+## Open Questions
+
+> [!IMPORTANT]
+> 1. **Dữ liệu video gốc**: Các video gốc trong `01_raw_data/` vẫn còn đầy đủ để chạy lại trích xuất joint positions chứ? Nếu không, chúng ta chỉ có thể thay đổi pipeline cho phần frontend (real-time) và backend (inference), nhưng không thể re-train model.
+> 2. **Frontend**: Yêu cầu của bạn chỉ nhắc đến backend. Frontend hiện tại dùng MoveNet (TFJS) chạy trong trình duyệt. Bạn có muốn tôi chuyển frontend sang MediaPipe JS luôn không, hay chỉ backend trước?
+
+---
+
+## Proposed Changes
+
+### MediaPipe Keypoint Selection (23 body keypoints)
+
+MediaPipe Pose có 33 landmarks. Loại bỏ 10 điểm mặt (0-10) không cần thiết cho bài tập phục hồi chức năng:
+
+| Index | Tên | Giữ/Bỏ |
+|-------|-----|---------|
+| 0 | nose | ❌ Bỏ |
+| 1-4 | left/right eye (inner/outer) | ❌ Bỏ |
+| 5-6 | left/right ear | ❌ Bỏ |
+| 7-8 | mouth left/right | ❌ Bỏ |
+| 9-10 | left/right eye outer | ❌ Bỏ |
+| 11 | left_shoulder | ✅ |
+| 12 | right_shoulder | ✅ |
+| 13 | left_elbow | ✅ |
+| 14 | right_elbow | ✅ |
+| 15 | left_wrist | ✅ |
+| 16 | right_wrist | ✅ |
+| 17-18 | left/right pinky | ❌ Bỏ |
+| 19-20 | left/right index | ❌ Bỏ |
+| 21-22 | left/right thumb | ❌ Bỏ |
+| 23 | left_hip | ✅ |
+| 24 | right_hip | ✅ |
+| 25 | left_knee | ✅ |
+| 26 | right_knee | ✅ |
+| 27 | left_ankle | ✅ |
+| 28 | right_ankle | ✅ |
+| 29 | left_heel | ✅ |
+| 30 | right_heel | ✅ |
+| 31 | left_foot_index | ✅ |
+| 32 | right_foot_index | ✅ |
+
+**Giữ lại 17 keypoints cốt lõi**: shoulder (2), elbow (2), wrist (2), hip (2), knee (2), ankle (2), heel (2), foot_index (2), **tổng = 16 keypoints + 1 midpoint** → 17 body keypoints (cộng 4 foot keypoints mới mà MoveNet không có).
+
+**Tổng thực tế giữ lại: 20 keypoints** (bỏ nose, mắt, tai, miệng, ngón tay).
+
+---
+
+### Component 1: Data Preparation — Joint Position Extraction
+
+#### [MODIFY] [01_extract_joint_positions.py](file:///c:/RehabAI/data-preparation/01_extract_joint_positions.py)
+
+Thay thế hoàn toàn MoveNet bằng MediaPipe Pose Landmarker:
+
+- **Sử dụng**: `mediapipe.tasks.python.vision.PoseLandmarker` (API mới nhất, không dùng legacy `mp.solutions.pose`)
+- **Model**: `pose_landmarker_heavy.task` (chất lượng cao nhất cho offline batch processing)
+- **Running mode**: `VIDEO` (xử lý từng frame theo thứ tự thời gian)
+- **Output format**: Mỗi frame xuất 20 keypoints × 4 giá trị (x, y, z, visibility) = 80 cột
+  - `{joint_name}_x` — tọa độ x normalized [0, 1]
+  - `{joint_name}_y` — tọa độ y normalized [0, 1]
+  - `{joint_name}_z` — tọa độ depth (chiều sâu, cùng scale với x)
+  - `{joint_name}_visibility` — độ tin cậy [0, 1]
+- **Bỏ hoàn toàn**: Crop region logic của MoveNet (MediaPipe tự xử lý detection)
+- **Bỏ hoàn toàn**: TensorFlow Hub dependency
+
+---
+
+### Component 2: Feature Engineering — 3D Joint Features
+
+#### [MODIFY] [joint_features.py](file:///c:/RehabAI/backend/joint_features.py)
+
+Viết lại toàn bộ để tận dụng 3D coordinates:
+
+**Thay đổi cốt lõi:**
+1. `get_joint_pair(df, name)` → `get_joint_3d(df, name)` trả về `[x, y, z]`
+2. `calculate_angle()` 2D → `calculate_angle_3d()` dùng **vector dot product** trong không gian 3D
+3. `calculate_distance()` 2D → `calculate_distance_3d()` dùng Euclidean 3D
+4. **Thêm features mới** cho rehabilitation:
+   - `torso_lean_angle` — góc nghiêng thân trên (deviation from vertical)
+   - `hip_flexion_angle_3d` — góc gập hông trong 3D
+   - `ankle_dorsiflexion` — góc gập bàn chân (dùng heel + foot_index mới)
+   - `shoulder_abduction_3d` — góc dang vai trong mặt phẳng frontal
+   - `spine_verticality` — independent midpoint shoulder ↔ hip deviation
+
+**Số features per exercise (ước tính):**
+| Exercise | MoveNet (cũ) | MediaPipe (mới) | Lý do tăng |
+|----------|-------------|-----------------|------------|
+| Es1 | 9 | ~14 | +3D angles, +torso lean, +foot angles |
+| Es2 | 9 | ~14 | +3D elbow angles, +shoulder abduction |
+| Es3 | 12 | ~17 | +3D shoulder rotation, +spine verticality |
+| Es4 | 6 | ~11 | +3D knee angles, +ankle dorsiflexion, +hip flexion |
+| Es5 | 9 | ~14 | +3D sit-to-stand metrics, +foot features |
+
+#### [MODIFY] [03_extract_joint_features.py](file:///c:/RehabAI/data-preparation/03_extract_joint_features.py)
+
+Cập nhật song song với `backend/joint_features.py`:
+- Sử dụng cùng hàm 3D mới
+- Cập nhật column names cho 4 giá trị per keypoint (x, y, z, visibility) thay vì 3 (y, x, confidence)
+- Scalers sẽ được fit lại với số features mới
+
+---
+
+### Component 3: Backend ML Pipeline
+
+#### [MODIFY] [ml_wrapper.py](file:///c:/RehabAI/backend/ml_wrapper.py)
+
+- `get_dataframe_cols()` → cập nhật danh sách 20 keypoints × 4 columns = 80 cột (thay vì 17 × 3 = 51)
+- `KEYPOINT_DICT` → đổi sang mapping MediaPipe 20 body keypoints
+- `reorder_dataframe()` → cập nhật theo cấu trúc mới
+- `prepare_data()` / `prepare_data_with_motion()` → giữ nguyên flow, chỉ thay đổi input shape
+- `test_model_inference()` → cập nhật pose template với tọa độ 3D
+
+#### [MODIFY] [feedback_engine.py](file:///c:/RehabAI/backend/feedback_engine.py)
+
+- `KEYPOINT_NAMES` → cập nhật danh sách 20 body keypoints
+- `KEYPOINT_INDEX` → cập nhật mapping index mới
+- `parse_keypoints()` → 80 floats (20 × 4) thay vì 51 (17 × 3)
+- `_angle_at_vertex()` → nâng cấp thành 3D angle calculation
+- Feedback rules giữ nguyên logic, chỉ cập nhật keypoint indices
+
+#### [MODIFY] [motion_detector.py](file:///c:/RehabAI/backend/motion_detector.py)
+
+- Không cần thay đổi logic (đã tính trên features, không trên raw keypoints)
+- Có thể cần điều chỉnh thresholds vì 3D features có scale khác
+
+#### [MODIFY] [main.py](file:///c:/RehabAI/backend/main.py)
+
+- `MAX_LENGTH_MAPPING` → có thể cần điều chỉnh nếu MediaPipe cho ra frame count khác (nhưng tùy thuộc vào video FPS, thường giữ nguyên)
+- Import paths giữ nguyên
+- WebSocket/REST endpoints giữ nguyên interface
+
+#### [MODIFY] [requirements.txt](file:///c:/RehabAI/backend/requirements.txt)
+
+- **Thêm**: `mediapipe>=0.10.18`
+- **Bỏ**: `tensorflow-hub` (không cần cho backend nữa, TF vẫn cần cho Keras models)
+
+---
+
+### Component 4: Training Pipeline
+
+#### [MODIFY] [clinical_score_prediction_model.py](file:///c:/RehabAI/training_models/clinical_score_prediction_model.py)
+
+- `load_and_prepare()` → tương thích với features mới (tự detect num_features từ data)
+- `build_robust_lstm()` → **giảm L2 regularization** từ `0.01` → `0.001` (khắc phục mode collapse)
+- **Thêm StandardScaler** vào pipeline training (fit trên X_train, transform X_val) — hiện tại pipeline training KHÔNG scale features trước khi đưa vào LSTM, đây là **bug lớn** gây ra model predict 65 cố định
+
+#### [MODIFY] [export_scalers_colab.py](file:///c:/RehabAI/training_models/export_scalers_colab.py)
+
+- Cập nhật feature extractors sang 3D
+- Phải sync chính xác với `backend/joint_features.py`
+
+#### [MODIFY] [lstm_model.py](file:///c:/RehabAI/training_models/lstm_model.py)
+
+- Cập nhật tương tự `clinical_score_prediction_model.py`
+
+---
+
+### Component 5: Model Asset
+
+#### [NEW] [models/pose_landmarker_heavy.task](file:///c:/RehabAI/models/pose_landmarker_heavy.task)
+
+- Download từ Google: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task`
+- Đặt tại `models/` để cả batch processing và backend inference đều dùng được
+
+---
+
+## Execution Order
+
+```mermaid
+graph TD
+    A["1. Cài mediapipe + Download model .task"] --> B["2. Viết lại joint_features.py (3D)"]
+    B --> C["3. Viết lại 01_extract_joint_positions.py (MediaPipe)"]
+    B --> D["4. Cập nhật ml_wrapper.py"]
+    B --> E["5. Cập nhật feedback_engine.py (3D angles)"]
+    C --> F["6. Cập nhật 03_extract_joint_features.py"]
+    D --> G["7. Cập nhật training scripts"]
+    F --> G
+    G --> H["8. Cập nhật export_scalers_colab.py"]
+    H --> I["9. Verify: backend starts, endpoints respond"]
+```
+
+## Verification Plan
+
+### Automated Tests
+1. **Backend startup**: `python main.py` — server khởi động không lỗi, tất cả models load thành công
+2. **Shape validation**: `GET /api/diagnostic/Es1` — verify preprocessing shape matches model input
+3. **Feature extraction**: Unit test `joint_features.py` với synthetic 3D data
+4. **Syntax check**: `python -c "import joint_features; import ml_wrapper; import feedback_engine"`
+
+### Manual Verification
+1. Re-run `01_extract_joint_positions.py` trên 1 video mẫu → verify CSV output có 80 columns (20 keypoints × 4)
+2. Re-run `03_extract_joint_features.py` → verify scaler fit thành công với features mới
+3. Re-train 1 model (Es1) → verify model không collapse về 65 điểm
+4. Test real-time inference qua frontend → verify clinical score responds to actual movement

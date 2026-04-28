@@ -1,0 +1,49 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# Model artifacts and Data (Large files)
+models/*.h5
+models/*.keras
+models/*.joblib
+models/*.task
+01_raw_data/
+02_clinical_labels/
+03_raw_joints/
+04_features/
+05_final_datasets/
+*.csv
+*.mp4
+
+# Frontend build
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.env*
+frontend/.eslintcache
+
+# Antigravity/Agentic logs
+.gemini/
+.planning/
+brain/
