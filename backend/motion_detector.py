@@ -36,12 +36,12 @@ class MotionResult:
 # Values are based on the biomechanical features each exercise extracts.
 # Tuned conservatively — a person doing the exercise even poorly should pass.
 
-# Each exercise has different feature columns (from joint_features.py):
-#   Es1: 9 features (angles + distances) — arm raises
-#   Es2: 9 features — arm/elbow movements
-#   Es3: 12 features — shoulder rotation
-#   Es4: 6 features — squats/leg movements
-#   Es5: 9 features — sit-to-stand
+# Each exercise has different feature columns (from joint_features.py — Paper 2 Table 2):
+#   Es1: 6 features — arm raises (elbow angles, hand/shoulder ratio, torso tilt, hand tilt, elbow diff)
+#   Es2: 6 features — lateral trunk tilt (elbow angles, torso tilt, elbow diff, shoulder angles)
+#   Es3: 9 features — trunk rotation (elbow angles, ratios, torso tilt, shoulder/arm-torso angles)
+#   Es4: 2 features — pelvis rotation (torso tilt, knee/hip ratio)
+#   Es5: 7 features — squatting (elbow angles, ratios, torso tilt, elbow diff, shoulder angles)
 
 # Thresholds: (min_variance, min_rom, min_displacement)
 # - min_variance: minimum average temporal variance across features
@@ -130,18 +130,28 @@ def detect_motion(features: np.ndarray, exercise_id: str) -> MotionResult:
     )
 
     # ── Activity Detection ────────────────────────────────────────────────
-    # OVERRIDDEN FOR MODEL TESTING
-    is_active = True
+    # Active if any two metrics exceed their thresholds
+    passes = sum([
+        avg_variance >= thresholds["min_variance"],
+        avg_rom >= thresholds["min_rom"],
+        avg_displacement >= thresholds["min_displacement"],
+    ])
+    is_active = passes >= 2
 
     # ── Quality Factor ────────────────────────────────────────────────────
-    # OVERRIDDEN FOR MODEL TESTING
-    motion_energy = 1.0
-    quality_factor = 1.0
+    # Maps motion_energy to a score multiplier [0.1, 1.0].
+    # Low motion → heavy penalty. High motion → no penalty.
+    expected = EXPECTED_ENERGY.get(exercise_id, 1.0)
+    if is_active:
+        quality_factor = min(1.0, 0.5 + 0.5 * (motion_energy / max(expected, 1e-8)))
+    else:
+        # Not active: apply heavy penalty but don't zero out completely
+        quality_factor = max(0.1, 0.3 * motion_energy)
 
     return MotionResult(
         is_active=is_active,
-        motion_energy=motion_energy,
-        quality_factor=quality_factor,
+        motion_energy=round(motion_energy, 4),
+        quality_factor=round(quality_factor, 4),
         rom_score=round(rom_score, 4),
         variance_score=round(variance_score, 4),
         frame_displacement_score=round(displacement_score, 4),

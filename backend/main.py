@@ -50,11 +50,11 @@ model_load_errors: dict = {}
 MODELS_DIRECTORY = "models/"
 
 MAX_LENGTH_MAPPING = {
-    "Es1": 301,
-    "Es2": 326,
+    "Es1": 150,
+    "Es2": 150,
     "Es3": 297,
-    "Es4": 398,
-    "Es5": 204,
+    "Es4": 150,
+    "Es5": 150,
 }
 
 
@@ -243,22 +243,28 @@ def _predict_clinical_score_from_csv(csv_string: str, max_length: int, exercise_
         )
 
     raw_prediction = model.predict(prepared_data, verbose=0)
-    raw_score = float(raw_prediction.flatten()[0] * 100.0)
+    raw_out = float(raw_prediction.flatten()[0])
 
-    # Apply motion-based calibration
-    calibrated = calibrate_score(raw_score, motion_result)
+    # Auto-detect normalization: v5 models output [0,1] (trained with y/50),
+    # older models output [0,50] directly (no normalization).
+    # If output ≤ 1.5, assume normalized → un-normalize ×50.
+    # If output > 1.5, assume raw [0,50] → use directly.
+    if raw_out <= 1.5:
+        raw_ts = raw_out * 50.0  # un-normalize from [0,1] to [0,50]
+    else:
+        raw_ts = raw_out         # already in [0,50] range
+    raw_score = float(np.clip(raw_ts, 0, 50) * 2.0)
 
     # --- DEBUG: Model output ---
     print(f"[DEBUG][{exercise_id}] Raw model output: {raw_prediction.flatten()}")
-    print(f"[DEBUG][{exercise_id}] Raw score: {raw_score:.2f}")
+    print(f"[DEBUG][{exercise_id}] Raw score (0-100): {raw_score:.2f}")
     print(f"[DEBUG][{exercise_id}] Motion active={motion_result.is_active}, "
           f"energy={motion_result.motion_energy:.3f}, "
           f"quality_factor={motion_result.quality_factor:.3f}")
-    print(f"[DEBUG][{exercise_id}] Calibrated score: {calibrated:.2f}")
 
     return {
         "raw_score": round(raw_score, 2),
-        "calibrated_score": calibrated,
+        "calibrated_score": round(raw_score, 2),  # Use raw score directly — model already discriminates
         "motion_detected": motion_result.is_active,
         "motion_energy": motion_result.motion_energy,
         "quality_factor": motion_result.quality_factor,

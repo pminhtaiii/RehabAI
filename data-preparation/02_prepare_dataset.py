@@ -1,160 +1,240 @@
+"""
+02_prepare_dataset.py — Build master metadata CSV from MediaPipe 3D joints
+==========================================================================
+Scans 03_raw_joints/ for MediaPipe CSV files produced by 01_extract_joint_positions.py,
+matches them with clinical scores from 02_clinical_labels/, and writes
+KiMoRe_final.csv for downstream use by 03_extract_joint_features.py.
+
+Pipeline:  01_extract_joint_positions.py → [this file] → 03_extract_joint_features.py
+
+Output CSV columns:
+  ID, clinical_group, expertise, exercise, video, joint_positions, clinical_score, #frames
+
+Usage:
+  Colab:  Change BASE_DIR to '/content/drive/MyDrive/RehabAI' and run
+  Local:  python 02_prepare_dataset.py
+"""
+
 import os
+import glob
 import pandas as pd
 import numpy as np
 
-# Configuration
-MOVENET_CSV_DIR = 'C:/RehabAI/03_raw_joints'
-VIDEO_BASE_DIR = 'C:/RehabAI/01_raw_data'
-FINAL_DATASET_DIR = 'C:/RehabAI/05_final_datasets'
+# ── Configuration ─────────────────────────────────────────────────────────────
+# Change this to match your environment:
+#   Colab:  '/content/drive/MyDrive/RehabAI'
+#   Local:  'C:/RehabAI'
+BASE_DIR = 'C:/RehabAI'
+
+JOINTS_DIR = f'{BASE_DIR}/03_raw_joints'
+VIDEO_DIR = f'{BASE_DIR}/01_raw_data'
+FINAL_DATASET_DIR = f'{BASE_DIR}/05_final_datasets'
 
 # Directories to search for ClinicalAssessment_*.xlsx files
 LABELS_SEARCH_DIRS = [
-    'C:/RehabAI/02_clinical_labels',
-    'C:/RehabAI'
+    f'{BASE_DIR}/02_clinical_labels',
+    BASE_DIR,
 ]
 LABELS_SEARCH_DIRS = [d for d in LABELS_SEARCH_DIRS if os.path.exists(d)]
 
-def read_clinical_score_simple(subject_id, exercise, clinical_group, expertise):
-    import glob
+
+# ── Clinical Score Reader ─────────────────────────────────────────────────────
+
+def read_clinical_score(subject_id, exercise, clinical_group, expertise):
+    """Read clinical score (TS only, range 0-50) from ClinicalAssessment Excel files.
+
+    Uses only the Total Score (TS) column as per the KIMORE dataset definition
+    (Capecci et al., 2019) and arXiv 2306.09546. TS = PO + CF, so we must NOT
+    add them again (that would double-count).
+
+    Searches in multiple possible locations following KiMoRe dataset structure:
+        02_clinical_labels/{clinical_group}/{expertise}/{subject_id}/{exercise}/Label/
+    """
     ex_num = exercise[-1:]
     ts_col = f'clinical TS Ex#{ex_num}'
-    po_col = f'clinical PO Ex#{ex_num}'
-    cf_col = f'clinical CF Ex#{ex_num}'
+
+    # Try subject_id with both underscore and space variants
+    possible_subject_ids = [
+        subject_id,
+        subject_id.replace('_', ' '),
+        subject_id.replace(' ', '_'),
+    ]
 
     for base_dir in LABELS_SEARCH_DIRS:
-        # Construct the expected path down to the exercise folder
-        # Handle cases where subject_id might use a space instead of an underscore (e.g., 'E ID1' instead of 'E_ID1')
-        possible_subject_ids = [subject_id, subject_id.replace('_', ' '), subject_id.replace(' ', '_')]
-        
-        exercise_dirs = []
         for s_id in possible_subject_ids:
-            exercise_dirs.append(os.path.join(base_dir, clinical_group, expertise, s_id, exercise))
-        
-        search_dirs = []
-        for ex_dir in exercise_dirs:
-            label_dir = os.path.join(ex_dir, 'Label')
-            search_dirs.extend([label_dir, ex_dir, os.path.dirname(ex_dir)])
-        
-        found_file = None
-        for s_dir in search_dirs:
-            if os.path.exists(s_dir):
-                # Look for ClinicalAssessment*.xlsx
-                pattern = os.path.join(s_dir, 'ClinicalAssessment*.xlsx')
-                matches = glob.glob(pattern)
+            # Build search paths from most specific to least
+            search_dirs = [
+                os.path.join(base_dir, clinical_group, expertise, s_id, exercise, 'Label'),
+                os.path.join(base_dir, clinical_group, expertise, s_id, exercise),
+                os.path.join(base_dir, clinical_group, expertise, s_id),
+            ]
+
+            for s_dir in search_dirs:
+                if not os.path.exists(s_dir):
+                    continue
+                matches = glob.glob(os.path.join(s_dir, 'ClinicalAssessment*.xlsx'))
                 if matches:
-                    found_file = matches[0]
-                    break
-                    
-        # Fallback recursive search if not found in specific directories
-        if not found_file:
-            for s_id in possible_subject_ids:
-                subject_dir = os.path.join(base_dir, clinical_group, expertise, s_id)
-                if os.path.exists(subject_dir):
-                    for root, _, files in os.walk(subject_dir):
-                        for f in files:
-                            if f.startswith('ClinicalAssessment') and f.endswith('.xlsx'):
-                                found_file = os.path.join(root, f)
-                                break
-                        if found_file:
-                            break
-                if found_file:
-                    break
+                    return _parse_clinical_file(matches[0], ts_col)
 
-        if found_file:
-            try:
-                score_df = pd.read_excel(found_file)
-                if ts_col in score_df.columns and po_col in score_df.columns and cf_col in score_df.columns:
-                    ts_val = pd.to_numeric(score_df[ts_col], errors='coerce').dropna()
-                    po_val = pd.to_numeric(score_df[po_col], errors='coerce').dropna()
-                    cf_val = pd.to_numeric(score_df[cf_col], errors='coerce').dropna()
-                    if not ts_val.empty and not po_val.empty and not cf_val.empty:
-                        return float(ts_val.iloc[0]) + float(po_val.iloc[0]) + float(cf_val.iloc[0])
-
-                # Fallback to sum of first 3 valid numbers if columns not strictly matched
-                numeric_values = pd.to_numeric(score_df.to_numpy().ravel(), errors='coerce')
-                numeric_values = [v for v in numeric_values if not np.isnan(v)]
-                if len(numeric_values) >= 3:
-                    pass
-            except Exception as e:
-                print(f'Could not read score from {found_file}: {e}')
-            
-            # Since we found the file but maybe failed to parse or find columns, we can either break or return
-            # We break to avoid searching other base_dirs if we already found the right file
-            break
+        # Fallback: recursive search under subject directory
+        for s_id in possible_subject_ids:
+            subject_dir = os.path.join(base_dir, clinical_group, expertise, s_id)
+            if not os.path.exists(subject_dir):
+                continue
+            for root, _, files in os.walk(subject_dir):
+                for f in files:
+                    if f.startswith('ClinicalAssessment') and f.endswith('.xlsx'):
+                        result = _parse_clinical_file(
+                            os.path.join(root, f), ts_col)
+                        if not np.isnan(result):
+                            return result
 
     return np.nan
 
-def main():
-    print("Starting dataset preparation...")
-    if not os.path.exists(MOVENET_CSV_DIR):
-        print(f"Error: Directory not found: {MOVENET_CSV_DIR}")
-        return
 
-    folders_to_process = [
-        d for d in os.listdir(MOVENET_CSV_DIR)
-        if os.path.isdir(os.path.join(MOVENET_CSV_DIR, d))
+def _parse_clinical_file(filepath, ts_col):
+    """Parse a ClinicalAssessment Excel file and return TS score (0-50)."""
+    try:
+        score_df = pd.read_excel(filepath)
+        if ts_col in score_df.columns:
+            ts_val = pd.to_numeric(score_df[ts_col], errors='coerce').dropna()
+            if not ts_val.empty:
+                return float(ts_val.iloc[0])
+    except Exception as e:
+        print(f'  ⚠ Could not read score from {filepath}: {e}')
+    return np.nan
+
+
+# ── CSV File Selection ────────────────────────────────────────────────────────
+
+def find_mediapipe_csv(exercise_path):
+    """Find the best joint positions CSV in an exercise directory.
+
+    Priority:
+      1. *_mediapipe.csv  (output of 01_extract_joint_positions.py with MediaPipe 3D)
+      2. Any .csv that is NOT a _features.csv
+
+    Returns the path to the selected CSV, or None if nothing found.
+    """
+    all_csvs = [
+        f for f in os.listdir(exercise_path)
+        if f.lower().endswith('.csv') and not f.endswith('_features.csv')
     ]
 
-    metadata_list = []
-    success_count = 0
-    missing_video_count = 0
-    missing_score_count = 0
+    if not all_csvs:
+        return None
 
-    for clinical_group in folders_to_process:
-        clinical_group_path = os.path.join(MOVENET_CSV_DIR, clinical_group)
+    # Prefer MediaPipe CSVs
+    mediapipe_csvs = [f for f in all_csvs if '_mediapipe' in f.lower()]
+    if mediapipe_csvs:
+        return os.path.join(exercise_path, mediapipe_csvs[0])
+
+    # Fallback to any non-feature CSV
+    return os.path.join(exercise_path, all_csvs[0])
+
+
+# ── Video File Lookup ─────────────────────────────────────────────────────────
+
+def find_video_path(clinical_group, expertise, subject_id, exercise):
+    """Locate the .mp4 video file for a given subject/exercise.
+
+    Checks both:
+      - {VIDEO_DIR}/{group}/{expertise}/{subject}/{exercise}/rgb/*.mp4
+      - {VIDEO_DIR}/{group}/{expertise}/{subject}/{exercise}/*.mp4
+    """
+    base = os.path.join(VIDEO_DIR, clinical_group, expertise, subject_id, exercise)
+
+    # Check rgb/ subdirectory first (standard KiMoRe layout)
+    rgb_dir = os.path.join(base, 'rgb')
+    if os.path.isdir(rgb_dir):
+        videos = [f for f in os.listdir(rgb_dir) if f.lower().endswith('.mp4')]
+        if videos:
+            return os.path.join(rgb_dir, videos[0])
+
+    # Check exercise directory directly
+    if os.path.isdir(base):
+        videos = [f for f in os.listdir(base) if f.lower().endswith('.mp4')]
+        if videos:
+            return os.path.join(base, videos[0])
+
+    return np.nan
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("  02_prepare_dataset.py — MediaPipe 3D Pipeline")
+    print("=" * 60)
+    print(f"  Joints dir:  {JOINTS_DIR}")
+    print(f"  Video dir:   {VIDEO_DIR}")
+    print(f"  Output dir:  {FINAL_DATASET_DIR}")
+    print()
+
+    if not os.path.exists(JOINTS_DIR):
+        print(f"Error: Joint positions directory not found: {JOINTS_DIR}")
+        print("  Run 01_extract_joint_positions.py first.")
+        return
+
+    # Traverse: clinical_group / expertise / subject_id / exercise
+    metadata_list = []
+    stats = {'success': 0, 'missing_video': 0, 'missing_score': 0, 'no_csv': 0}
+
+    clinical_groups = [
+        d for d in sorted(os.listdir(JOINTS_DIR))
+        if os.path.isdir(os.path.join(JOINTS_DIR, d))
+    ]
+
+    for clinical_group in clinical_groups:
+        group_path = os.path.join(JOINTS_DIR, clinical_group)
         expertise_levels = [
-            d for d in os.listdir(clinical_group_path)
-            if os.path.isdir(os.path.join(clinical_group_path, d))
+            d for d in sorted(os.listdir(group_path))
+            if os.path.isdir(os.path.join(group_path, d))
         ]
 
         for expertise in expertise_levels:
-            expertise_path = os.path.join(clinical_group_path, expertise)
+            expertise_path = os.path.join(group_path, expertise)
             subject_ids = [
-                d for d in os.listdir(expertise_path)
+                d for d in sorted(os.listdir(expertise_path))
                 if os.path.isdir(os.path.join(expertise_path, d))
             ]
 
             for subj_id in subject_ids:
                 subject_path = os.path.join(expertise_path, subj_id)
                 exercises = [
-                    d for d in os.listdir(subject_path)
+                    d for d in sorted(os.listdir(subject_path))
                     if os.path.isdir(os.path.join(subject_path, d))
                 ]
 
                 for exercise in exercises:
                     exercise_path = os.path.join(subject_path, exercise)
-                    csv_files = [
-                        f for f in os.listdir(exercise_path)
-                        if f.lower().endswith('.csv') and not f.endswith('_features.csv')
-                    ]
 
-                    if len(csv_files) == 0:
+                    # Find MediaPipe CSV
+                    csv_path = find_mediapipe_csv(exercise_path)
+                    if csv_path is None:
+                        stats['no_csv'] += 1
                         continue
 
-                    movenet_path = os.path.join(exercise_path, csv_files[0])
-
+                    # Count frames
                     try:
-                        num_frames = len(pd.read_csv(movenet_path))
+                        num_frames = len(pd.read_csv(csv_path))
                     except Exception as e:
-                        print(f'Error processing {movenet_path}: {e}')
+                        print(f'  ⚠ Error reading {csv_path}: {e}')
                         continue
 
-                    video_path = np.nan
-                    rgb_folder = os.path.join(VIDEO_BASE_DIR, clinical_group, expertise, subj_id, exercise, 'rgb')
-                    if os.path.isdir(rgb_folder):
-                        video_files = [
-                            f for f in os.listdir(rgb_folder)
-                            if f.lower().endswith('.mp4')
-                        ]
-                        if len(video_files) > 0:
-                            video_path = os.path.join(rgb_folder, video_files[0])
+                    # Find video
+                    video_path = find_video_path(
+                        clinical_group, expertise, subj_id, exercise)
 
-                    clinical_score = read_clinical_score_simple(subj_id, exercise, clinical_group, expertise)
+                    # Read clinical score
+                    clinical_score = read_clinical_score(
+                        subj_id, exercise, clinical_group, expertise)
 
+                    # Track stats
                     if pd.isna(video_path):
-                        missing_video_count += 1
+                        stats['missing_video'] += 1
                     if pd.isna(clinical_score):
-                        missing_score_count += 1
+                        stats['missing_score'] += 1
 
                     metadata_list.append({
                         'ID': subj_id,
@@ -162,31 +242,51 @@ def main():
                         'expertise': expertise,
                         'exercise': exercise,
                         'video': video_path,
-                        'joint_positions': movenet_path,
+                        'joint_positions': csv_path,
                         'clinical_score': clinical_score,
-                        '#frames': num_frames
+                        '#frames': num_frames,
                     })
-                    success_count += 1
+                    stats['success'] += 1
 
-    print(f'Processed files: {success_count}')
-    print(f'Missing video files: {missing_video_count}')
-    print(f'Missing clinical scores: {missing_score_count}')
-
-    df_meta = pd.DataFrame(metadata_list)
-    
+    # Build DataFrame with consistent column order
     expected_columns = [
-        'ID', 'clinical_group', 'expertise', 'exercise', 'video', 
-        'joint_positions', 'clinical_score', '#frames'
+        'ID', 'clinical_group', 'expertise', 'exercise',
+        'video', 'joint_positions', 'clinical_score', '#frames',
     ]
+    df_meta = pd.DataFrame(metadata_list)
     for col in expected_columns:
         if col not in df_meta.columns:
             df_meta[col] = np.nan
     df_meta = df_meta[expected_columns]
 
+    # Save
     os.makedirs(FINAL_DATASET_DIR, exist_ok=True)
     output_path = os.path.join(FINAL_DATASET_DIR, 'KiMoRe_final.csv')
     df_meta.to_csv(output_path, index=False)
-    print(f'Saved metadata dataset to: {output_path}')
+
+    # Summary
+    print(f"\n{'=' * 60}")
+    print(f"  Summary:")
+    print(f"    Total entries:          {stats['success']}")
+    print(f"    Missing video files:    {stats['missing_video']}")
+    print(f"    Missing clinical scores:{stats['missing_score']}")
+    print(f"    Dirs without CSV:       {stats['no_csv']}")
+    print(f"")
+
+    if not df_meta.empty:
+        print(f"  Per-exercise breakdown:")
+        for ex in sorted(df_meta['exercise'].dropna().unique()):
+            ex_df = df_meta[df_meta['exercise'] == ex]
+            valid_scores = ex_df['clinical_score'].dropna()
+            print(f"    {ex}: {len(ex_df)} samples, "
+                  f"{len(valid_scores)} with scores"
+                  f" (range: {valid_scores.min():.0f}-{valid_scores.max():.0f})"
+                  if len(valid_scores) > 0 else
+                  f"    {ex}: {len(ex_df)} samples, 0 with scores")
+
+    print(f"\n  Output: {output_path}")
+    print(f"{'=' * 60}")
+
 
 if __name__ == "__main__":
     main()

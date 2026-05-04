@@ -10,10 +10,10 @@ import { api } from '../../api';
 
 // Keypoint dictionary
 const KEYPOINT_DICT = {
-  'nose': 0, 'left_eye': 1, 'right_eye': 2, 'left_ear': 3, 'right_ear': 4,
-  'left_shoulder': 5, 'right_shoulder': 6, 'left_elbow': 7, 'right_elbow': 8,
-  'left_wrist': 9, 'right_wrist': 10, 'left_hip': 11, 'right_hip': 12,
-  'left_knee': 13, 'right_knee': 14, 'left_ankle': 15, 'right_ankle': 16
+    'nose': 0, 'left_eye': 1, 'right_eye': 2, 'left_ear': 3, 'right_ear': 4,
+    'left_shoulder': 5, 'right_shoulder': 6, 'left_elbow': 7, 'right_elbow': 8,
+    'left_wrist': 9, 'right_wrist': 10, 'left_hip': 11, 'right_hip': 12,
+    'left_knee': 13, 'right_knee': 14, 'left_ankle': 15, 'right_ankle': 16
 };
 
 export default function Exercise() {
@@ -29,10 +29,10 @@ export default function Exercise() {
     const movenetRef = useRef(null);
     const rendererRef = useRef(null);
     const referenceDFRef = useRef(null);
-    
+
     // Performance: Use array instead of pandas-js dataframe for 60FPS pushes
-    const framesRef = useRef([]); 
-    
+    const framesRef = useRef([]);
+
     // State
     const [isSaving, setIsSaving] = useState(false);
     const [isExerciseFinished, setIsExerciseFinished] = useState(false);
@@ -61,41 +61,41 @@ export default function Exercise() {
 
         let isMounted = true;
         const initCameraAndAI = async () => {
-             // 1. Setup Camera
-             try {
-                 const stream = await navigator.mediaDevices.getUserMedia({
-                     audio: false,
-                     video: { facingMode: 'user', width: 640, height: 480, frameRate: { ideal: 30 } }
-                 });
-                 if (videoRef.current) {
-                     videoRef.current.srcObject = stream;
-                     videoRef.current.onloadedmetadata = () => {
-                         videoRef.current.play();
-                         setVideoLoaded(true);
-                     };
-                 }
-             } catch (e) {
-                 console.error("Camera error", e);
-             }
+            // 1. Setup Camera
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: false,
+                    video: { facingMode: 'user', width: 640, height: 480, frameRate: { ideal: 30 } }
+                });
+                if (videoRef.current) {
+                    videoRef.current.srcObject = stream;
+                    videoRef.current.onloadedmetadata = () => {
+                        videoRef.current.play();
+                        setVideoLoaded(true);
+                    };
+                }
+            } catch (e) {
+                console.error("Camera error", e);
+            }
 
-             // 2. Setup TFJS & MoveNet
-             await tf.setBackend('webgl');
-             await tf.ready();
-             // Performance Fix: Use LIGHTNING model for real-time smoothness
-             const detectorConfig = { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING };
-             movenetRef.current = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
-             if (canvasRef.current) {
-                 rendererRef.current = new RendererCanvas2d(canvasRef.current);
-             }
+            // 2. Setup TFJS & MoveNet
+            await tf.setBackend('webgl');
+            await tf.ready();
+            // Performance Fix: Use LIGHTNING model for real-time smoothness
+            const detectorConfig = { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING };
+            movenetRef.current = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+            if (canvasRef.current) {
+                rendererRef.current = new RendererCanvas2d(canvasRef.current);
+            }
 
-             // 3. Load Reference Data
-             try {
+            // 3. Load Reference Data
+            try {
                 const response = await fetch(exerciseInfo.csv);
                 const csvText = await response.text();
                 referenceDFRef.current = new MiniDataFrame(csvToJSON(csvText));
-             } catch (e) { console.error("CSV loading error", e); }
+            } catch (e) { console.error("CSV loading error", e); }
 
-             if (isMounted) detectPose();
+            if (isMounted) detectPose();
         };
 
         initCameraAndAI();
@@ -121,17 +121,20 @@ export default function Exercise() {
 
             const video = videoRef.current;
             const canvas = canvasRef.current;
-            if(canvas.width !== videoWidth) {
+            if (canvas.width !== videoWidth) {
                 canvas.width = videoWidth;
                 canvas.height = videoHeight;
             }
             const ctx = canvas.getContext('2d');
-            
+
             const poses = await movenetRef.current.estimatePoses(video, { flipHorizontal: false, flipVertical: false });
-            
+
             if (isSavingRef.current && poses[0]) {
-                const normalizedKeypoints = poseDetection.calculators.keypointsToNormalizedKeypoints(poses[0].keypoints, video);
-                
+                const normalizedKeypoints = poseDetection.calculators.keypointsToNormalizedKeypoints(
+                    poses[0].keypoints,
+                    { width: video.videoWidth || videoWidth, height: video.videoHeight || videoHeight }
+                );
+
                 const frameData = {};
                 for (const [jointName, jointIndex] of Object.entries(KEYPOINT_DICT)) {
                     const keypoint = normalizedKeypoints[jointIndex];
@@ -145,7 +148,7 @@ export default function Exercise() {
 
                 // Every 30 frames, do DTW comparison
                 if (framesRef.current.length % 30 === 0 && referenceDFRef.current) {
-                   compareJointsWithReference(framesRef.current);
+                    compareJointsWithReference(framesRef.current);
                 }
             }
 
@@ -156,7 +159,7 @@ export default function Exercise() {
             ctx.drawImage(video, 0, 0, videoWidth, videoHeight);
             if (rendererRef.current && poses.length > 0) rendererRef.current.drawResults(poses);
             ctx.restore();
-            
+
             reqAFRef.current = requestAnimationFrame(findPose);
         };
         findPose();
@@ -287,7 +290,7 @@ export default function Exercise() {
     // 6. Triggers 
     const timerIntervalRef = useRef(null);
     const exerciseTimerRef = useRef(null);
-    
+
     const startExerciseCountDown = () => {
         setCountdown(10);
         const inv = setInterval(() => {
@@ -314,10 +317,10 @@ export default function Exercise() {
         setFeedbackLatency(null);
         setMotionDetected(null);
         setMotionEnergy(null);
-        
+
         // Connect WebSocket for real-time feedback
         connectWebSocket(exerciseInfo.exercise_id);
-        
+
         if (referenceVideoRef.current) {
             referenceVideoRef.current.currentTime = 0;
             referenceVideoRef.current.play();
@@ -327,7 +330,7 @@ export default function Exercise() {
         // Performance Fix: decouple stopwatch from 60FPS react re-renders
         timerIntervalRef.current = setInterval(() => {
             setElapsedTime((Date.now() - startTimestamp) / 1000);
-        }, 500); 
+        }, 500);
 
         // Progressive clinical score: request score every 5 seconds
         progressiveScoreIntervalRef.current = setInterval(() => {
@@ -351,9 +354,9 @@ export default function Exercise() {
         if (exerciseTimerRef.current) clearTimeout(exerciseTimerRef.current);
         if (progressiveScoreIntervalRef.current) clearInterval(progressiveScoreIntervalRef.current);
         if (referenceVideoRef.current) referenceVideoRef.current.pause();
-        
+
         disconnectWebSocket();
-        
+
         setIsExerciseFinished(true);
         fetchClinicalScore();
     };
@@ -363,7 +366,7 @@ export default function Exercise() {
     // Formatting 
     const isReady = videoLoaded; // camera is on
     const timeLeft = 30 - Math.floor(elapsedTime);
-    let displayTime = isSaving ? `00:${timeLeft < 10 ? '0'+timeLeft : timeLeft}` : "00:00";
+    let displayTime = isSaving ? `00:${timeLeft < 10 ? '0' + timeLeft : timeLeft}` : "00:00";
 
     return (
         <div className="bg-background text-on-background min-h-screen pb-20 font-['Inter']">
@@ -407,13 +410,13 @@ export default function Exercise() {
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-[60vh] min-h-[400px]">
                             {/* Reference Exercise Feed */}
                             <div className="bg-surface-container-low rounded-xl overflow-hidden relative group h-full">
-                                <video 
-                                    ref={referenceVideoRef} 
-                                    src={exerciseInfo.video_url} 
-                                    loop 
-                                    playsInline 
-                                    muted 
-                                    className="w-full h-full object-cover grayscale-[20%]" 
+                                <video
+                                    ref={referenceVideoRef}
+                                    src={exerciseInfo.video_url}
+                                    loop
+                                    playsInline
+                                    muted
+                                    className="w-full h-full object-cover grayscale-[20%]"
                                 />
                                 <div className="absolute inset-0 bg-gradient-to-t from-primary/40 to-transparent pointer-events-none"></div>
                                 <div className="absolute bottom-6 left-6 flex items-center gap-3">
@@ -440,7 +443,7 @@ export default function Exercise() {
                         <div className="flex gap-3 justify-center mt-6">
                             {!isSaving && !countdown && (
                                 <button onClick={startExerciseCountDown} disabled={!isReady} className={`px-8 py-4 text-white font-bold rounded-lg shadow-sm transition-transform active:scale-95 flex items-center gap-2 ${isReady ? 'bg-[#6ABE4E] hover:bg-[#5aa842]' : 'bg-gray-400'}`}>
-                                    <span className="material-symbols-outlined" style={{fontVariationSettings: "'FILL' 1"}}>play_arrow</span>
+                                    <span className="material-symbols-outlined" style={{ fontVariationSettings: "'FILL' 1" }}>play_arrow</span>
                                     {isReady ? "Start Exercise" : "Starting Camera..."}
                                 </button>
                             )}
@@ -457,119 +460,116 @@ export default function Exercise() {
                         {/* Stats Column */}
                         <div className="flex flex-col gap-6">
                             {/* Progress & Stats Card */}
-                        <div className="bg-surface-container-lowest p-6 rounded-lg shadow-[0_20px_40px_rgba(21,49,40,0.04)]">
-                            <div className="flex justify-between items-center mb-6">
-                                <div>
-                                    <p className="text-[10px] uppercase tracking-[0.1em] font-bold text-on-surface-variant mb-1">Clinical Score</p>
-                                    <p className="text-3xl font-extrabold text-primary">
-                                        {clinicalScore !== null 
-                                            ? Number(clinicalScore).toFixed(0) 
-                                            : liveScore !== null 
-                                                ? <span className="animate-pulse">{Number(liveScore).toFixed(0)}</span>
-                                                : "--"}
-                                        <span className="text-sm font-medium text-on-surface-variant ml-1">/100</span>
-                                    </p>
-                                    {feedbackLatency !== null && isSaving && (
-                                        <p className="text-[9px] text-on-surface-variant mt-1">
-                                            {feedbackLatency.toFixed(0)}ms latency
+                            <div className="bg-surface-container-lowest p-6 rounded-lg shadow-[0_20px_40px_rgba(21,49,40,0.04)]">
+                                <div className="flex justify-between items-center mb-6">
+                                    <div>
+                                        <p className="text-[10px] uppercase tracking-[0.1em] font-bold text-on-surface-variant mb-1">Clinical Score</p>
+                                        <p className="text-3xl font-extrabold text-primary">
+                                            {clinicalScore !== null
+                                                ? Number(clinicalScore).toFixed(0)
+                                                : liveScore !== null
+                                                    ? <span className="animate-pulse">{Number(liveScore).toFixed(0)}</span>
+                                                    : "--"}
+                                            <span className="text-sm font-medium text-on-surface-variant ml-1">/100</span>
                                         </p>
-                                    )}
-                                </div>
-                                <div className="text-right">
-                                    <p className="text-[10px] uppercase tracking-[0.1em] font-bold text-on-surface-variant mb-1">Time Remaining</p>
-                                    <p className="text-3xl font-mono font-bold text-secondary">{displayTime}</p>
-                                </div>
-                            </div>
-                            {/* Progress bar */}
-                            <div className="h-2 w-full bg-surface-container rounded-full overflow-hidden">
-                                <div className="h-full bg-[#6ABE4E] rounded-full transition-all duration-500" style={{width: `${Math.min(100, (elapsedTime / 30) * 100)}%`}}></div>
-                            </div>
-
-                            {/* Live Motion Energy Indicator */}
-                            {isSaving && motionEnergy !== null && (
-                                <div className="flex items-center gap-3 mt-3 px-1">
-                                    <span className="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant whitespace-nowrap">Motion Level</span>
-                                    <div className="h-1.5 flex-1 bg-surface-container rounded-full overflow-hidden">
-                                        <div className={`h-full rounded-full transition-all duration-700 ${
-                                            motionEnergy > 0.5 ? 'bg-[#6ABE4E]' : motionEnergy > 0.2 ? 'bg-amber-400' : 'bg-red-400'
-                                        }`} style={{width: `${Math.min(100, motionEnergy * 100)}%`}}></div>
-                                    </div>
-                                    <span className={`text-[10px] font-bold ${
-                                        motionDetected ? 'text-[#6ABE4E]' : 'text-amber-500'
-                                    }`}>{motionDetected ? 'Active' : 'Low'}</span>
-                                </div>
-                            )}
-                        </div>
-
-                        {/* Secondary Actions */}
-                        {isSaving && (
-                            <div className="grid grid-cols-2 gap-3 pt-4">
-                                <button onClick={() => {}} className="py-3 px-2 bg-surface-container-high hover:bg-surface-variant rounded-lg text-xs font-bold text-on-surface-variant transition-colors flex flex-col items-center gap-1">
-                                    <span className="material-symbols-outlined text-lg">pause</span> Pause
-                                </button>
-                                <button onClick={stopExerciseSession} className="py-3 px-2 bg-error-container/30 hover:bg-error-container text-error rounded-lg text-xs font-bold transition-colors flex flex-col items-center gap-1">
-                                    <span className="material-symbols-outlined text-lg">stop</span> Stop
-                                </button>
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Feedback Column */}
-                    <div className="flex flex-col gap-6">
-                        {/* Live Feedback Cards */}
-                        <div className="flex flex-col gap-4">
-                            <h3 className="text-sm font-bold uppercase tracking-widest text-on-surface-variant px-1">Real-time Guidance</h3>
-
-                            {isSaving && currentFeedbackMessages.length === 0 && (
-                                <div className="bg-[#B0D182]/20 border-l-4 border-[#6ABE4E] p-4 rounded-lg flex items-start gap-4">
-                                    <span className="material-symbols-outlined text-[#6ABE4E]" style={{fontVariationSettings: "'FILL' 1"}}>check_circle</span>
-                                    <div>
-                                        <p className="font-bold text-[#153128]">Perfect Alignment</p>
-                                        <p className="text-sm text-on-surface-variant mt-1">Movement matches reference frame optimally.</p>
-                                    </div>
-                                </div>
-                            )}
-
-                            {currentFeedbackMessages.map((msg, i) => (
-                                <div key={i} className="bg-surface-variant/50 p-4 rounded-lg flex items-start gap-4 border-l-4 border-amber-500">
-                                    <span className="material-symbols-outlined text-amber-500">info</span>
-                                    <div>
-                                        <p className="font-bold text-primary">Adjustment Needed</p>
-                                        <p className="text-sm text-on-surface-variant mt-1">{msg.message}</p>
-                                    </div>
-                                </div>
-                            ))}
-
-                            {!isSaving && !clinicalScore && (
-                                <div className="bg-surface-container-low p-4 rounded-lg text-sm text-on-surface-variant">
-                                    Start the exercise to receive live AI posture feedback.
-                                </div>
-                            )}
-                            {clinicalScore !== null && (
-                                <div className="p-4 rounded-lg flex items-start gap-4 border-l-4 bg-secondary-container/50 border-secondary">
-                                    <span className="material-symbols-outlined text-secondary" style={{fontVariationSettings: "'FILL' 1"}}>
-                                        verified
-                                    </span>
-                                    <div>
-                                        <p className="font-bold text-primary">Session Finished</p>
-                                        <p className="text-sm text-on-surface-variant mt-1">Tuyệt vời! Điểm lâm sàng đã được ghi nhận.</p>
-                                        {motionEnergy !== null && (
-                                            <div className="mt-2 flex items-center gap-2">
-                                                <span className="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant">Motion</span>
-                                                <div className="h-1.5 w-20 bg-surface-container rounded-full overflow-hidden">
-                                                    <div className={`h-full rounded-full transition-all ${
-                                                        motionEnergy > 0.5 ? 'bg-[#6ABE4E]' : motionEnergy > 0.2 ? 'bg-amber-400' : 'bg-red-400'
-                                                    }`} style={{width: `${Math.min(100, motionEnergy * 100)}%`}}></div>
-                                                </div>
-                                                <span className="text-[10px] text-on-surface-variant">{(motionEnergy * 100).toFixed(0)}%</span>
-                                            </div>
+                                        {feedbackLatency !== null && isSaving && (
+                                            <p className="text-[9px] text-on-surface-variant mt-1">
+                                                {feedbackLatency.toFixed(0)}ms latency
+                                            </p>
                                         )}
                                     </div>
+                                    <div className="text-right">
+                                        <p className="text-[10px] uppercase tracking-[0.1em] font-bold text-on-surface-variant mb-1">Time Remaining</p>
+                                        <p className="text-3xl font-mono font-bold text-secondary">{displayTime}</p>
+                                    </div>
+                                </div>
+                                {/* Progress bar */}
+                                <div className="h-2 w-full bg-surface-container rounded-full overflow-hidden">
+                                    <div className="h-full bg-[#6ABE4E] rounded-full transition-all duration-500" style={{ width: `${Math.min(100, (elapsedTime / 30) * 100)}%` }}></div>
+                                </div>
+
+                                {/* Live Motion Energy Indicator */}
+                                {isSaving && motionEnergy !== null && (
+                                    <div className="flex items-center gap-3 mt-3 px-1">
+                                        <span className="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant whitespace-nowrap">Motion Level</span>
+                                        <div className="h-1.5 flex-1 bg-surface-container rounded-full overflow-hidden">
+                                            <div className={`h-full rounded-full transition-all duration-700 ${motionEnergy > 0.5 ? 'bg-[#6ABE4E]' : motionEnergy > 0.2 ? 'bg-amber-400' : 'bg-red-400'
+                                                }`} style={{ width: `${Math.min(100, motionEnergy * 100)}%` }}></div>
+                                        </div>
+                                        <span className={`text-[10px] font-bold ${motionDetected ? 'text-[#6ABE4E]' : 'text-amber-500'
+                                            }`}>{motionDetected ? 'Active' : 'Low'}</span>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Secondary Actions */}
+                            {isSaving && (
+                                <div className="grid grid-cols-2 gap-3 pt-4">
+                                    <button onClick={() => { }} className="py-3 px-2 bg-surface-container-high hover:bg-surface-variant rounded-lg text-xs font-bold text-on-surface-variant transition-colors flex flex-col items-center gap-1">
+                                        <span className="material-symbols-outlined text-lg">pause</span> Pause
+                                    </button>
+                                    <button onClick={stopExerciseSession} className="py-3 px-2 bg-error-container/30 hover:bg-error-container text-error rounded-lg text-xs font-bold transition-colors flex flex-col items-center gap-1">
+                                        <span className="material-symbols-outlined text-lg">stop</span> Stop
+                                    </button>
                                 </div>
                             )}
                         </div>
+
+                        {/* Feedback Column */}
+                        <div className="flex flex-col gap-6">
+                            {/* Live Feedback Cards */}
+                            <div className="flex flex-col gap-4">
+                                <h3 className="text-sm font-bold uppercase tracking-widest text-on-surface-variant px-1">Real-time Guidance</h3>
+
+                                {isSaving && currentFeedbackMessages.length === 0 && (
+                                    <div className="bg-[#B0D182]/20 border-l-4 border-[#6ABE4E] p-4 rounded-lg flex items-start gap-4">
+                                        <span className="material-symbols-outlined text-[#6ABE4E]" style={{ fontVariationSettings: "'FILL' 1" }}>check_circle</span>
+                                        <div>
+                                            <p className="font-bold text-[#153128]">Perfect Alignment</p>
+                                            <p className="text-sm text-on-surface-variant mt-1">Movement matches reference frame optimally.</p>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {currentFeedbackMessages.map((msg, i) => (
+                                    <div key={i} className="bg-surface-variant/50 p-4 rounded-lg flex items-start gap-4 border-l-4 border-amber-500">
+                                        <span className="material-symbols-outlined text-amber-500">info</span>
+                                        <div>
+                                            <p className="font-bold text-primary">Adjustment Needed</p>
+                                            <p className="text-sm text-on-surface-variant mt-1">{msg.message}</p>
+                                        </div>
+                                    </div>
+                                ))}
+
+                                {!isSaving && !clinicalScore && (
+                                    <div className="bg-surface-container-low p-4 rounded-lg text-sm text-on-surface-variant">
+                                        Start the exercise to receive live AI posture feedback.
+                                    </div>
+                                )}
+                                {clinicalScore !== null && (
+                                    <div className="p-4 rounded-lg flex items-start gap-4 border-l-4 bg-secondary-container/50 border-secondary">
+                                        <span className="material-symbols-outlined text-secondary" style={{ fontVariationSettings: "'FILL' 1" }}>
+                                            verified
+                                        </span>
+                                        <div>
+                                            <p className="font-bold text-primary">Session Finished</p>
+                                            <p className="text-sm text-on-surface-variant mt-1">Tuyệt vời! Điểm lâm sàng đã được ghi nhận.</p>
+                                            {motionEnergy !== null && (
+                                                <div className="mt-2 flex items-center gap-2">
+                                                    <span className="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant">Motion</span>
+                                                    <div className="h-1.5 w-20 bg-surface-container rounded-full overflow-hidden">
+                                                        <div className={`h-full rounded-full transition-all ${motionEnergy > 0.5 ? 'bg-[#6ABE4E]' : motionEnergy > 0.2 ? 'bg-amber-400' : 'bg-red-400'
+                                                            }`} style={{ width: `${Math.min(100, motionEnergy * 100)}%` }}></div>
+                                                    </div>
+                                                    <span className="text-[10px] text-on-surface-variant">{(motionEnergy * 100).toFixed(0)}%</span>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
                     </div>
-                </div>
                 </div>
             </main>
         </div>

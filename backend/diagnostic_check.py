@@ -99,7 +99,7 @@ def check_inference(loaded_models):
     from ml_wrapper import prepare_data, get_dataframe_cols
     
     MAX_LENGTH_MAPPING = {
-        "Es1": 301, "Es2": 326, "Es3": 297, "Es4": 398, "Es5": 204,
+        "Es1": 150, "Es2": 150, "Es3": 297, "Es4": 150, "Es5": 150,
     }
     
     cols = get_dataframe_cols()
@@ -115,8 +115,8 @@ def check_inference(loaded_models):
         )
         try:
             zeros_prepared = prepare_data(zeros_df, max_len, ex)
-            zeros_pred = model.predict(zeros_prepared, verbose=0) * 100.0
-            zeros_score = float(zeros_pred.flatten()[0])
+            zeros_pred = model.predict(zeros_prepared, verbose=0)
+            zeros_score = float(np.clip(zeros_pred.flatten()[0] * 50.0, 0, 50) * 2.0)
         except Exception as e:
             print(f"  ✗ {ex}: zeros test failed: {e}")
             all_ok = False
@@ -128,8 +128,8 @@ def check_inference(loaded_models):
             columns=cols,
         )
         random_prepared = prepare_data(random_df, max_len, ex)
-        random_pred = model.predict(random_prepared, verbose=0) * 100.0
-        random_score = float(random_pred.flatten()[0])
+        random_pred = model.predict(random_prepared, verbose=0)
+        random_score = float(np.clip(random_pred.flatten()[0] * 50.0, 0, 50) * 2.0)
         
         # Test 3: Different random
         random2_df = pd.DataFrame(
@@ -137,8 +137,8 @@ def check_inference(loaded_models):
             columns=cols,
         )
         random2_prepared = prepare_data(random2_df, max_len, ex)
-        random2_pred = model.predict(random2_prepared, verbose=0) * 100.0
-        random2_score = float(random2_pred.flatten()[0])
+        random2_pred = model.predict(random2_prepared, verbose=0)
+        random2_score = float(np.clip(random2_pred.flatten()[0] * 50.0, 0, 50) * 2.0)
         
         scores = [zeros_score, random_score, random2_score]
         score_range = max(scores) - min(scores)

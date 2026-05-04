@@ -1,278 +1,164 @@
-import pandas as pd
+"""
+joint_features.py — Real-time feature extraction from MediaPipe landmarks
+===================================================================================
+Extracts 2D features with aspect ratio correction from incoming MediaPipe landmarks.
+These functions mirror 03_extract_joint_features.py EXACTLY so that
+inference matches training.
+
+MediaPipe landmark mapping:
+0: nose
+11, 12: left_shoulder, right_shoulder
+13, 14: left_elbow, right_elbow
+15, 16: left_wrist, right_wrist
+23, 24: left_hip, right_hip
+25, 26: left_knee, right_knee
+"""
+
 import numpy as np
-import math
+import pandas as pd
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2D Geometry Functions (Aspect Ratio Corrected)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_joint_2d(df, joint_name):
+    """Return (N, 2) array of [x, y] with aspect ratio corrected (x * 1.7778)."""
+    return np.column_stack((
+        df[f"{joint_name}_x"] * 1.7778,
+        df[f"{joint_name}_y"]
+    ))
+
+def calculate_angle_2d(first, middle, end):
+    """Angle (degrees) at vertex *middle* in 2D. Uses atan2(cross, dot)."""
+    v1 = np.array(first) - np.array(middle)
+    v2 = np.array(end) - np.array(middle)
+    
+    # Cross product in 2D: x1*y2 - x2*y1
+    cross_prod = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    dot_prod = np.sum(v1 * v2, axis=1)
+    
+    # Use abs to ensure angle is between 0 and 180
+    return pd.Series(np.degrees(np.abs(np.arctan2(cross_prod, dot_prod))))
+
+def calculate_distance_2d(pair1, pair2):
+    """Euclidean distance in 2D between two (N, 2) joint arrays."""
+    return pd.Series(np.linalg.norm(pair1 - pair2, axis=1))
+
+def get_torso_vector_2d(df):
+    """Torso vector from shoulder midpoint to hip midpoint (N, 2)."""
+    shoulder_mid = (get_joint_2d(df, "left_shoulder") + get_joint_2d(df, "right_shoulder")) / 2
+    hip_mid = (get_joint_2d(df, "left_hip") + get_joint_2d(df, "right_hip")) / 2
+    return hip_mid - shoulder_mid
+
+def calculate_vector_angle_2d(vec1, vec2):
+    """Angle (degrees) between two (N, 2) vector arrays."""
+    dot = np.sum(vec1 * vec2, axis=1)
+    norm1 = np.linalg.norm(vec1, axis=1)
+    norm2 = np.linalg.norm(vec2, axis=1)
+    cos_angle = dot / (norm1 * norm2 + 1e-8)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return pd.Series(np.degrees(np.arccos(cos_angle)))
 
 
-def get_joint_pair(df, joint_name):
-  return [df[f"{joint_name}_x"], df[f"{joint_name}_y"]]
-
-
-def calculate_angle(first, middle, end):
-    first = np.array(first)
-    middle = np.array(middle)
-    end = np.array(end)
-
-    radians = np.arctan2(end[1]-middle[1], end[0]-middle[0]) - np.arctan2(first[1]-middle[1], first[0]-middle[0])
-    angle = np.abs(radians*180.0/np.pi)
-
-    angles = [360-a if a > 180 else a for a in angle]
-    return angles
-
-
-def calculate_distance(pair1, pair2):
-  pair1_x, pair1_y = pair1
-  pair2_x, pair2_y = pair2
-  return pd.Series([math.dist([x1, y1], [x2, y2]) for x1, y1, x2, y2 in zip(pair1_x, pair1_y, pair2_x, pair2_y)])
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-Exercise Feature Extractors
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_es1_features(df):
-  features_df = pd.DataFrame()
-
-  features_df["left_arm_torso_angle"] = calculate_angle(get_joint_pair(df, "left_elbow"),
-                                                   get_joint_pair(df, "left_shoulder"),
-                                                   get_joint_pair(df, "left_hip"))
-
-  features_df["right_arm_torso_angle"] = calculate_angle(get_joint_pair(df, "right_elbow"),
-                                                   get_joint_pair(df, "right_shoulder"),
-                                                   get_joint_pair(df, "right_hip"))
-
-  features_df["left_elbow_extension_angle"] = calculate_angle(get_joint_pair(df, "left_shoulder"),
-                                                     get_joint_pair(df, "left_elbow"),
-                                                     get_joint_pair(df, "left_wrist"))
-
-  features_df["right_elbow_extension_angle"] = calculate_angle(get_joint_pair(df, "right_shoulder"),
-                                                     get_joint_pair(df, "right_elbow"),
-                                                     get_joint_pair(df, "right_wrist"))
-
-  features_df["left_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "left_hip"),
-                                                    get_joint_pair(df, "left_knee"),
-                                                    get_joint_pair(df, "left_ankle"))
-
-  features_df["right_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "right_hip"),
-                                                    get_joint_pair(df, "right_knee"),
-                                                    get_joint_pair(df, "right_ankle"))
-
-  mid_hip_point = [(get_joint_pair(df, "left_hip")[0] + get_joint_pair(df, "right_hip")[0])/2, (get_joint_pair(df, "left_hip")[1] + get_joint_pair(df, "right_hip")[1])/2]
-  features_df["hip_angle"] = calculate_angle(get_joint_pair(df, "left_hip"),
-                                        mid_hip_point,
-                                        get_joint_pair(df, "right_hip"))
-
-  features_df["hands_dist"] = calculate_distance(get_joint_pair(df, "left_wrist"), get_joint_pair(df, "right_wrist"))
-
-  features_df["ankle_dist"] = calculate_distance(get_joint_pair(df, "left_ankle"), get_joint_pair(df, "right_ankle"))
-
-  return features_df
-
+    """Es1 — Lifting of arms (6 features)."""
+    features_df = pd.DataFrame()
+    left_elbow = calculate_angle_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"), get_joint_2d(df, "left_wrist"))
+    features_df["left_elbow_angle"] = left_elbow
+    right_elbow = calculate_angle_2d(get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"), get_joint_2d(df, "right_wrist"))
+    features_df["right_elbow_angle"] = right_elbow
+    hands_dist = calculate_distance_2d(get_joint_2d(df, "left_wrist"), get_joint_2d(df, "right_wrist"))
+    shoulder_dist = calculate_distance_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "right_shoulder"))
+    features_df["hand_shoulder_ratio"] = hands_dist / (shoulder_dist + 1e-8)
+    torso_vec = get_torso_vector_2d(df)
+    vertical = np.tile([0, 1], (len(df), 1))
+    features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
+    hand_vec = get_joint_2d(df, "right_wrist") - get_joint_2d(df, "left_wrist")
+    horizontal = np.tile([1, 0], (len(df), 1))
+    features_df["hand_tilted_angle"] = calculate_vector_angle_2d(hand_vec, horizontal)
+    features_df["elbow_angles_diff"] = np.abs(left_elbow - right_elbow)
+    return features_df
 
 def get_es2_features(df):
-  features_df = pd.DataFrame()
-
-  features_df["left_elbow_extension_angle"] = calculate_angle(get_joint_pair(df, "left_shoulder"),
-                                                     get_joint_pair(df, "left_elbow"),
-                                                     get_joint_pair(df, "left_wrist"))
-
-  features_df["right_elbow_extension_angle"] = calculate_angle(get_joint_pair(df, "right_shoulder"),
-                                                     get_joint_pair(df, "right_elbow"),
-                                                     get_joint_pair(df, "right_wrist"))
-
-  features_df["left_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "left_hip"),
-                                                    get_joint_pair(df, "left_knee"),
-                                                    get_joint_pair(df, "left_ankle"))
-
-  features_df["right_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "right_hip"),
-                                                    get_joint_pair(df, "right_knee"),
-                                                    get_joint_pair(df, "right_ankle"))
-
-  mid_hip_point = [(get_joint_pair(df, "left_hip")[0] + get_joint_pair(df, "right_hip")[0])/2, (get_joint_pair(df, "left_hip")[1] + get_joint_pair(df, "right_hip")[1])/2]
-  features_df["hip_angle"] = calculate_angle(get_joint_pair(df, "left_hip"),
-                                        mid_hip_point,
-                                        get_joint_pair(df, "right_hip"))
-
-  features_df["hands_dist"] = calculate_distance(get_joint_pair(df, "left_wrist"), get_joint_pair(df, "right_wrist"))
-
-  features_df["shoulder_dist"] = calculate_distance(get_joint_pair(df, "left_shoulder"), get_joint_pair(df, "right_shoulder"))
-
-  features_df["left_shoulder_wrist_vert_dist"] = np.abs(df["left_shoulder_y"] - df["left_wrist_y"])
-
-  features_df["right_shoulder_wrist_vert_dist"] = np.abs(df["right_shoulder_y"] - df["right_wrist_y"])
-
-  return features_df
-
+    """Es2 — Lateral tilt of trunk (6 features)."""
+    features_df = pd.DataFrame()
+    left_elbow = calculate_angle_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"), get_joint_2d(df, "left_wrist"))
+    features_df["left_elbow_angle"] = left_elbow
+    right_elbow = calculate_angle_2d(get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"), get_joint_2d(df, "right_wrist"))
+    features_df["right_elbow_angle"] = right_elbow
+    torso_vec = get_torso_vector_2d(df)
+    vertical = np.tile([0, 1], (len(df), 1))
+    features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
+    features_df["elbow_angles_diff"] = np.abs(left_elbow - right_elbow)
+    features_df["left_shoulder_angle"] = calculate_angle_2d(get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"))
+    features_df["right_shoulder_angle"] = calculate_angle_2d(get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"))
+    return features_df
 
 def get_es3_features(df):
-  features_df = pd.DataFrame()
-
-  features_df["elbows_horiz_dist"] = np.abs(df["left_elbow_x"] - df["right_elbow_x"])
-
-  features_df["left_elbow_extension_angle"] = calculate_angle(get_joint_pair(df, "left_shoulder"),
-                                                     get_joint_pair(df, "left_elbow"),
-                                                     get_joint_pair(df, "left_wrist"))
-
-  features_df["right_elbow_extension_angle"] = calculate_angle(get_joint_pair(df, "right_shoulder"),
-                                                     get_joint_pair(df, "right_elbow"),
-                                                     get_joint_pair(df, "right_wrist"))
-
-  features_df["left_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "left_hip"),
-                                                    get_joint_pair(df, "left_knee"),
-                                                    get_joint_pair(df, "left_ankle"))
-
-  features_df["right_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "right_hip"),
-                                                    get_joint_pair(df, "right_knee"),
-                                                    get_joint_pair(df, "right_ankle"))
-
-  features_df["left_shoulder_extension_angle"] = calculate_angle(get_joint_pair(df, "left_elbow"),
-                                                     get_joint_pair(df, "left_shoulder"),
-                                                     get_joint_pair(df, "right_shoulder"))
-
-  features_df["right_shoulder_extension_angle"] = calculate_angle(get_joint_pair(df, "right_elbow"),
-                                                     get_joint_pair(df, "right_shoulder"),
-                                                     get_joint_pair(df, "left_shoulder"))
-
-  mid_hip_point = [(get_joint_pair(df, "left_hip")[0] + get_joint_pair(df, "right_hip")[0])/2, (get_joint_pair(df, "left_hip")[1] + get_joint_pair(df, "right_hip")[1])/2]
-  features_df["hip_angle"] = calculate_angle(get_joint_pair(df, "left_hip"),
-                                        mid_hip_point,
-                                        get_joint_pair(df, "right_hip"))
-
-  features_df["hands_dist"] = calculate_distance(get_joint_pair(df, "left_wrist"), get_joint_pair(df, "right_wrist"))
-
-  features_df["shoulder_dist"] = calculate_distance(get_joint_pair(df, "left_shoulder"), get_joint_pair(df, "right_shoulder"))
-
-  features_df["hip_dist"] = calculate_distance(get_joint_pair(df, "left_hip"), get_joint_pair(df, "right_hip"))
-
-  features_df["left_shoulder_wrist_vert_dist"] = np.abs(df["left_shoulder_y"] - df["left_wrist_y"])
-
-  features_df["right_shoulder_wrist_vert_dist"] = np.abs(df["right_shoulder_y"] - df["right_wrist_y"])
-
-  return features_df
-
+    """Es3 — Trunk rotation (9 features)."""
+    features_df = pd.DataFrame()
+    left_elbow = calculate_angle_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"), get_joint_2d(df, "left_wrist"))
+    features_df["left_elbow_angle"] = left_elbow
+    right_elbow = calculate_angle_2d(get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"), get_joint_2d(df, "right_wrist"))
+    features_df["right_elbow_angle"] = right_elbow
+    hands_dist = calculate_distance_2d(get_joint_2d(df, "left_wrist"), get_joint_2d(df, "right_wrist"))
+    shoulder_dist = calculate_distance_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "right_shoulder"))
+    features_df["hand_shoulder_ratio"] = hands_dist / (shoulder_dist + 1e-8)
+    torso_vec = get_torso_vector_2d(df)
+    vertical = np.tile([0, 1], (len(df), 1))
+    features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
+    features_df["elbow_angles_diff"] = np.abs(left_elbow - right_elbow)
+    features_df["left_shoulder_angle"] = calculate_angle_2d(get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"))
+    features_df["right_shoulder_angle"] = calculate_angle_2d(get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"))
+    left_arm_vec = get_joint_2d(df, "left_elbow") - get_joint_2d(df, "left_shoulder")
+    features_df["left_arm_torso_angle"] = calculate_vector_angle_2d(torso_vec, left_arm_vec)
+    right_arm_vec = get_joint_2d(df, "right_elbow") - get_joint_2d(df, "right_shoulder")
+    features_df["right_arm_torso_angle"] = calculate_vector_angle_2d(torso_vec, right_arm_vec)
+    return features_df
 
 def get_es4_features(df):
-  features_df = pd.DataFrame()
-
-  features_df["left_elbow_extension_angle"] = calculate_angle(get_joint_pair(df, "left_shoulder"),
-                                                     get_joint_pair(df, "left_elbow"),
-                                                     get_joint_pair(df, "left_wrist"))
-
-  features_df["right_elbow_extension_angle"] = calculate_angle(get_joint_pair(df, "right_shoulder"),
-                                                     get_joint_pair(df, "right_elbow"),
-                                                     get_joint_pair(df, "right_wrist"))
-
-  features_df["left_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "left_hip"),
-                                                    get_joint_pair(df, "left_knee"),
-                                                    get_joint_pair(df, "left_ankle"))
-
-  features_df["right_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "right_hip"),
-                                                    get_joint_pair(df, "right_knee"),
-                                                    get_joint_pair(df, "right_ankle"))
-
-  features_df["shoulder_dist"] = calculate_distance(get_joint_pair(df, "left_shoulder"), get_joint_pair(df, "right_shoulder"))
-
-  features_df["hip_dist"] = calculate_distance(get_joint_pair(df, "left_hip"), get_joint_pair(df, "right_hip"))
-
-  return features_df
-
+    """Es4 — Pelvis rotation (2 features)."""
+    features_df = pd.DataFrame()
+    torso_vec = get_torso_vector_2d(df)
+    vertical = np.tile([0, 1], (len(df), 1))
+    features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
+    knee_dist = calculate_distance_2d(get_joint_2d(df, "left_knee"), get_joint_2d(df, "right_knee"))
+    hip_dist = calculate_distance_2d(get_joint_2d(df, "left_hip"), get_joint_2d(df, "right_hip"))
+    features_df["knee_hip_ratio"] = knee_dist / (hip_dist + 1e-8)
+    return features_df
 
 def get_es5_features(df):
-  features_df = pd.DataFrame()
+    """Es5 — Squatting (7 features)."""
+    features_df = pd.DataFrame()
+    left_elbow = calculate_angle_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"), get_joint_2d(df, "left_wrist"))
+    features_df["left_elbow_angle"] = left_elbow
+    right_elbow = calculate_angle_2d(get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"), get_joint_2d(df, "right_wrist"))
+    features_df["right_elbow_angle"] = right_elbow
+    hands_dist = calculate_distance_2d(get_joint_2d(df, "left_wrist"), get_joint_2d(df, "right_wrist"))
+    shoulder_dist = calculate_distance_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "right_shoulder"))
+    features_df["hand_shoulder_ratio"] = hands_dist / (shoulder_dist + 1e-8)
+    torso_vec = get_torso_vector_2d(df)
+    vertical = np.tile([0, 1], (len(df), 1))
+    features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
+    features_df["elbow_angles_diff"] = np.abs(left_elbow - right_elbow)
+    features_df["left_shoulder_angle"] = calculate_angle_2d(get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"))
+    features_df["right_shoulder_angle"] = calculate_angle_2d(get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"))
+    return features_df
 
-  features_df["left_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "left_hip"),
-                                                    get_joint_pair(df, "left_knee"),
-                                                    get_joint_pair(df, "left_ankle"))
+FEATURE_EXTRACTORS = {
+    'Es1': get_es1_features,
+    'Es2': get_es2_features,
+    'Es3': get_es3_features,
+    'Es4': get_es4_features,
+    'Es5': get_es5_features,
+}
 
-  features_df["right_knee_extension_angle"] = calculate_angle(get_joint_pair(df, "right_hip"),
-                                                    get_joint_pair(df, "right_knee"),
-                                                    get_joint_pair(df, "right_ankle"))
-
-  features_df["hands_dist"] = calculate_distance(get_joint_pair(df, "left_wrist"), get_joint_pair(df, "right_wrist"))
-
-  features_df["shoulder_dist"] = calculate_distance(get_joint_pair(df, "left_shoulder"), get_joint_pair(df, "right_shoulder"))
-
-  features_df["hip_dist"] = calculate_distance(get_joint_pair(df, "left_hip"), get_joint_pair(df, "right_hip"))
-
-  features_df["knee_dist"] = calculate_distance(get_joint_pair(df, "left_knee"), get_joint_pair(df, "right_knee"))
-
-  features_df["ankle_dist"] = calculate_distance(get_joint_pair(df, "left_ankle"), get_joint_pair(df, "right_ankle"))
-
-  features_df["left_shoulder_wrist_dist"] = calculate_distance(get_joint_pair(df, "left_shoulder"), get_joint_pair(df, "left_wrist"))
-
-  features_df["right_shoulder_wrist_dist"] = calculate_distance(get_joint_pair(df, "right_shoulder"), get_joint_pair(df, "right_wrist"))
-
-  return features_df
-
-
-# ── Temporal Statistics (appended as constant features per sample) ────────────
-
-TEMPORAL_STAT_NAMES = [
-    'overall_variance',
-    'overall_rom',
-    'total_displacement',
-    'movement_smoothness',
-    'active_ratio',
-]
-
-
-def compute_temporal_statistics(features_array):
-    """Compute per-sample temporal statistics from a (T, F) feature array.
-
-    Returns a 1D array of 5 scalar values that summarize the temporal
-    dynamics of the movement.  These are appended as constant columns
-    to every frame so the LSTM has explicit access to motion quality
-    information.
-
-    Designed for small-N regression: only 5 extra features to avoid
-    curse of dimensionality with ~72 samples.
-    """
-    features_array = np.asarray(features_array, dtype=np.float64)
-    T, F = features_array.shape
-
-    if T < 2:
-        return np.zeros(5, dtype=np.float64)
-
-    # 1. Average variance across all feature channels
-    per_feature_var = np.var(features_array, axis=0)
-    overall_variance = float(np.mean(per_feature_var))
-
-    # 2. Average range of motion (max - min per feature)
-    per_feature_rom = np.ptp(features_array, axis=0)
-    overall_rom = float(np.mean(per_feature_rom))
-
-    # 3. Total displacement (mean frame-to-frame absolute difference)
-    diffs = np.abs(np.diff(features_array, axis=0))
-    total_displacement = float(np.mean(diffs))
-
-    # 4. Movement smoothness (mean autocorrelation at lag-1)
-    autocorrs = []
-    for f in range(F):
-        signal = features_array[:, f]
-        if np.std(signal) > 1e-8:
-            corr = np.corrcoef(signal[:-1], signal[1:])[0, 1]
-            if not np.isnan(corr):
-                autocorrs.append(corr)
-    smoothness = float(np.mean(autocorrs)) if autocorrs else 0.0
-
-    # 5. Active ratio (fraction of frames with above-threshold movement)
-    frame_displacements = np.mean(diffs, axis=1)
-    threshold = np.median(frame_displacements) * 0.5
-    active_ratio = float(np.mean(frame_displacements > threshold))
-
-    return np.array([
-        overall_variance,
-        overall_rom,
-        total_displacement,
-        smoothness,
-        active_ratio,
-    ], dtype=np.float64)
-
-
-def append_temporal_statistics(features_array):
-    """Compute temporal stats and append as constant columns to every frame.
-
-    Input:  (T, F_orig) raw feature array
-    Output: (T, F_orig + 5) expanded feature array
-    """
-    features_array = np.asarray(features_array, dtype=np.float64)
-    T = features_array.shape[0]
-    stats = compute_temporal_statistics(features_array)
-    # Broadcast stats to every frame: (T, 5)
-    stats_broadcast = np.tile(stats, (T, 1))
-    return np.hstack([features_array, stats_broadcast])
+def extract_features(df, exercise):
+    extractor = FEATURE_EXTRACTORS.get(exercise)
+    if not extractor:
+        return pd.DataFrame()
+    return extractor(df)

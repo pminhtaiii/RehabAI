@@ -47,3 +47,14 @@ frontend/.eslintcache
 .gemini/
 .planning/
 brain/
+
+# Compressed archives
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Temporary files & local logs
+backend_logs*.txt
+bt*.c
