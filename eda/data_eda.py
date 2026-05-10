@@ -1,21 +1,11 @@
-"""
-Auto-converted from data_eda.ipynb on 2026-04-25 19:04:47
-"""
 
-# %%
-# Importing necessary packages
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# %%
-# Reading data from a CSV file into a DataFrame
-data = pd .read_csv('/content/drive/MyDrive/rehab-ai-data/KiMoRe_final/KiMoRe_data_movenet_features.csv')
-data
 
-# %%
-# Function to create a subplot for joint positions
+data = pd.read_csv('/content/drive/MyDrive/rehab-ai-data/KiMoRe_final/KiMoRe_data_movenet_features.csv')
 def subplot(values, joint, type, coordinate, smooth=False):
   fig_title = f'{type} - {joint} ({coordinate})'
   if smooth:

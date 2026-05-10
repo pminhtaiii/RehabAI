@@ -9,12 +9,13 @@ Uses biomechanical angle analysis instead of raw DTW distance.
 import math
 import numpy as np
 
-# MoveNet keypoint order (matches ml_wrapper.py and frontend KEYPOINT_DICT)
 KEYPOINT_NAMES = [
-    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist", "left_hip", "right_hip",
-    "left_knee", "right_knee", "left_ankle", "right_ankle",
+    "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist",
+    "left_hip", "right_hip",
+    "left_knee", "right_knee",
+    "left_ankle", "right_ankle",
 ]
 
 KEYPOINT_INDEX = {name: i for i, name in enumerate(KEYPOINT_NAMES)}
@@ -22,7 +23,7 @@ KEYPOINT_INDEX = {name: i for i, name in enumerate(KEYPOINT_NAMES)}
 
 def _angle_at_vertex(p1, p2, p3):
     """Calculate angle (degrees) at vertex p2 formed by rays p2->p1 and p2->p3.
-    Each point is [y, x] matching MoveNet output order."""
+    Each point is [y, x] matching frontend output order."""
     v1y = float(p1[0]) - float(p2[0])
     v1x = float(p1[1]) - float(p2[1])
     v2y = float(p3[0]) - float(p2[0])
@@ -140,11 +141,11 @@ COMPILED_COMMON_RULES = _compile_rules(_COMMON_RULES)
 
 
 def parse_keypoints(flat_values):
-    """Convert flat list (51 floats: 17 keypoints × [y, x, confidence]) to 17×3 array."""
+    """Convert flat list (36 floats: 12 body joints × [y, x, visibility]) to 12×3 array."""
     arr = np.asarray(flat_values, dtype=np.float32)
-    if arr.size != 51:
-        raise ValueError(f"Expected 51 values (17 keypoints × 3), got {arr.size}")
-    return arr.reshape(17, 3)
+    if arr.size != 36:
+        raise ValueError(f"Expected 36 values (12 keypoints × 3), got {arr.size}")
+    return arr.reshape(12, 3)
 
 
 def generate_feedback(exercise_id, reference_values, current_values):

@@ -1,20 +1,7 @@
-"""
-01_extract_joint_positions.py — MediaPipe Pose 3D (Tasks API)
-==============================================================
-Extract 3D body landmarks from exercise videos using MediaPipe PoseLandmarker.
+"""Extract 3D body landmarks from exercise videos using MediaPipe PoseLandmarker.
 
-Uses the new Tasks API (compatible with mediapipe >= 0.10.x on Colab).
-The old mp.solutions.pose API is deprecated and may not work on newer versions.
-
-Output CSV columns per keypoint: {name}_x, {name}_y, {name}_z, {name}_v
-Total: 12 body keypoints × 4 = 48 columns per frame.
-
-Output files are saved with '_mediapipe' suffix to avoid overwriting
-existing MoveNet data (e.g., E_ID1_Es1_mediapipe.csv).
-
-Usage:
-  Colab:  Change BASE_DIR to '/content/drive/MyDrive/RehabAI' and run
-  Local:  python 01_extract_joint_positions.py
+Uses the new Tasks API (mediapipe >= 0.10.x). Output CSV has columns per keypoint:
+{name}_x, {name}_y, {name}_z, {name}_v (12 keypoints × 4 = 48 columns per frame).
 """
 
 import os
@@ -27,10 +14,7 @@ import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python import BaseOptions
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-# Change this to match your environment:
-#   Colab:  '/content/drive/MyDrive/RehabAI'
-#   Local:  'C:/RehabAI'
+
 BASE_DIR = 'C:/RehabAI'
 
 INPUT_BASE_DIR = f'{BASE_DIR}/01_raw_data'

@@ -1,5 +1,6 @@
 # Importing necessary libraries
 import os
+import json
 import pandas as pd
 import numpy as np
 import joblib
@@ -13,9 +14,6 @@ from joint_features import (
 from motion_detector import detect_motion, calibrate_score, MotionResult
 
 
-# ── MediaPipe Body Keypoints ─────────────────────────────────────────────────
-# 12 body joints (face/hand landmarks excluded).
-# Must match frontend MEDIAPIPE_BODY_LANDMARKS and joint_features.py exactly.
 MEDIAPIPE_BODY_KEYPOINTS = [
     "left_shoulder", "right_shoulder",
     "left_elbow", "right_elbow",
@@ -47,8 +45,10 @@ MASK_VALUE = -999.0
 
 # Temporal downsampling — must match training (--downsample 5).
 # Training applies stride=5 BEFORE scaling, reducing 25fps→5fps.
-# Inference webcam is ~30fps, so stride=5 → ~6fps (close enough).
-DOWNSAMPLE_STRIDE = 5
+# Inference webcam is ~30fps, so stride=6 → 30/6=5fps to match training.
+# Reference: KiMoRe dataset recorded at 25fps (Bassi et al., 2021).
+DOWNSAMPLE_STRIDE = 5       # Training stride (25fps / 5 = 5fps)
+WEBCAM_DOWNSAMPLE_STRIDE = 6  # Webcam stride (30fps / 6 = 5fps) — matches training fps
 
 
 def temporal_downsample(feat_arr, stride, target_len):
@@ -67,18 +67,87 @@ def temporal_downsample(feat_arr, stride, target_len):
     return np.concatenate([head, tail], axis=0)
 
 
+def trim_to_active_region(features: np.ndarray, min_active_ratio: float = 0.2) -> np.ndarray:
+    """Trim idle prefix/suffix from a feature sequence (P3+P4).
+
+    Uses frame-to-frame displacement with EMA smoothing to find
+    the first and last active frames, then returns only that region.
+    Preserves temporal continuity — does NOT concatenate non-contiguous
+    segments, so the LSTM sees a valid time series.
+
+    Args:
+        features: (T, F) ndarray of raw features.
+        min_active_ratio: Don't trim if active region < this fraction of total.
+
+    Returns:
+        Trimmed features array. Same as input if trimming is not applicable.
+    """
+    T = features.shape[0]
+    if T < 10:
+        return features
+
+    # Per-frame displacement: RMS across features
+    frame_diffs = np.sqrt(np.mean(np.diff(features, axis=0) ** 2, axis=1))
+
+    # EMA smoothing (α=0.3) to reduce MediaPipe jitter
+    alpha = 0.3
+    smoothed = np.empty_like(frame_diffs)
+    smoothed[0] = frame_diffs[0]
+    for i in range(1, len(frame_diffs)):
+        smoothed[i] = alpha * frame_diffs[i] + (1.0 - alpha) * smoothed[i - 1]
+
+    # Adaptive threshold: median of non-trivial displacements × 0.15
+    non_trivial = smoothed[smoothed > 1e-3]
+    if len(non_trivial) < 5:
+        return features  # Almost entirely static — let hard gate handle it
+
+    threshold = float(np.median(non_trivial) * 0.15)
+
+    # Classify each frame-pair as active/idle
+    is_active = smoothed > threshold
+    active_indices = np.where(is_active)[0]
+
+    if len(active_indices) == 0:
+        return features  # No active frames detected
+
+    # Map diff indices back to feature indices:
+    # diff[i] = features[i+1] - features[i], so active diff i → features [i, i+1]
+    start_idx = max(0, int(active_indices[0]))
+    end_idx = min(T - 1, int(active_indices[-1]) + 1)  # +1 for diff→frame offset
+    active_length = end_idx - start_idx + 1
+
+    # Safety: don't trim too aggressively
+    if active_length < T * min_active_ratio:
+        print(f"[ACTIVE_TRIM] Skip: active region too small "
+              f"({active_length}/{T} = {active_length/T:.1%})")
+        return features
+
+    # Don't trim if barely anything would be removed
+    if active_length >= T * 0.95:
+        return features  # Already mostly active, no benefit from trimming
+
+    trimmed = features[start_idx:end_idx + 1]
+    print(f"[ACTIVE_TRIM] Trimmed {T} → {trimmed.shape[0]} frames "
+          f"[{start_idx}:{end_idx+1}], removed "
+          f"{T - trimmed.shape[0]} idle frames ({(T - trimmed.shape[0])/T:.0%})")
+
+    return trimmed
+
+
 def _auto_scale_score(raw_out):
-    """Auto-detect normalization and convert model output to 0-100 score.
+    """Auto-detect normalization and convert model output to 0-50 score.
 
     v5 models output [0,1] (trained with y/50) → un-normalize ×50.
     Older models output [0,50] directly → use as-is.
     Threshold: output ≤ 1.5 → normalized; > 1.5 → raw.
+
+    Returns score in [0, 50] — the native clinical scale from KiMoRe.
     """
     if raw_out <= 1.5:
         raw_ts = raw_out * 50.0
     else:
         raw_ts = raw_out
-    return float(np.clip(raw_ts, 0, 50) * 2.0)
+    return float(np.clip(raw_ts, 0, 50))
 
 SCALERS_DIR = os.environ.get("SCALERS_DIR", "models/")
 _scalers_cache: dict = {}
@@ -102,6 +171,53 @@ def load_scaler(exercise_id: str):
     return scaler
 
 
+# ---- RF ensemble support ----
+
+_rf_models_cache: dict = {}
+_model_configs_cache: dict = {}
+
+
+def load_rf_model(exercise_id: str):
+    if exercise_id in _rf_models_cache:
+        return _rf_models_cache[exercise_id]
+    path = os.path.join(SCALERS_DIR, f"rf_model_{exercise_id}.joblib")
+    if not os.path.exists(path):
+        print(f"[ml_wrapper] RF model not found for {exercise_id} at {path} — LSTM-only mode")
+        _rf_models_cache[exercise_id] = None
+        return None
+    rf_model = joblib.load(path)
+    _rf_models_cache[exercise_id] = rf_model
+    print(f"[ml_wrapper] Loaded RF model for {exercise_id} from {path}")
+    return rf_model
+
+
+def load_model_config(exercise_id: str) -> dict:
+    if exercise_id in _model_configs_cache:
+        return _model_configs_cache[exercise_id]
+    path = os.path.join(SCALERS_DIR, f"model_config_{exercise_id}.json")
+    if not os.path.exists(path):
+        print(f"[ml_wrapper] Model config not found for {exercise_id} at {path} — using defaults")
+        default = {"ensemble_alpha": 0.5}
+        _model_configs_cache[exercise_id] = default
+        return default
+    with open(path, "r") as f:
+        config = json.load(f)
+    _model_configs_cache[exercise_id] = config
+    print(f"[ml_wrapper] Loaded model config for {exercise_id}: alpha={config.get('ensemble_alpha', 0.5)}")
+    return config
+
+
+def extract_summary_features(feat_array: np.ndarray) -> np.ndarray:
+    means = np.mean(feat_array, axis=0)
+    stds = np.std(feat_array, axis=0)
+    ranges = np.max(feat_array, axis=0) - np.min(feat_array, axis=0)
+    return np.concatenate([means, stds, ranges]).reshape(1, -1)
+
+
+def predict_ensemble(lstm_score: float, rf_score: float, alpha: float) -> float:
+    return float(np.clip(alpha * lstm_score + (1 - alpha) * rf_score, 0, 50))
+
+
 FEATURE_EXTRACTORS = {
     "Es1": get_es1_features,
     "Es2": get_es2_features,
@@ -123,7 +239,11 @@ def _safe_extract_features(df, exercise_id):
         raise ValueError(f"Unsupported exercise_id: {exercise_id}")
 
     # Fill NaN in input keypoints BEFORE feature extraction
-    df_clean = df.fillna(0.0)
+    # Fix: forward-fill then backward-fill instead of fillna(0.0)
+    # Reason: (0,0) is top-left corner of frame — filling NaN with 0
+    # corrupts angle/distance features (e.g., elbow_angle from origin).
+    # Forward-fill preserves temporal continuity; bfill handles leading NaN.
+    df_clean = df.ffill().bfill().fillna(0.0)
 
     # DEBUG: Check input columns and sample values
     body_joints = ["left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
@@ -228,23 +348,14 @@ def prepare_data(df, max_length, exercise_id):
     return data
 
 
-def prepare_data_with_motion(df, max_length, exercise_id):
-    """Prepare input data AND run motion detection on raw features.
+def prepare_data_with_motion(df, max_length, exercise_id, source="video"):
+    df = df.head(1500)
 
-    Returns:
-        tuple: (prepared_data, motion_result)
-            - prepared_data: np.ndarray ready for model.predict()
-            - motion_result: MotionResult from motion_detector
-    """
-    df = df.head(1500)  # 30fps × 50s safety margin
-
-    # Step 1: Feature engineering
     features = _safe_extract_features(df, exercise_id)
 
-    # Step 1.5: Temporal downsampling — MUST match training pipeline
-    features = temporal_downsample(features, DOWNSAMPLE_STRIDE, max_length)
+    stride = WEBCAM_DOWNSAMPLE_STRIDE if source == "webcam" else DOWNSAMPLE_STRIDE
+    features = temporal_downsample(features, stride, max_length)
 
-    # Step 2: Motion detection on downsampled RAW features (before scaling)
     motion_result = detect_motion(features, exercise_id)
     print(f"[MOTION][{exercise_id}] active={motion_result.is_active}, "
           f"energy={motion_result.motion_energy:.3f}, "
@@ -253,13 +364,16 @@ def prepare_data_with_motion(df, max_length, exercise_id):
           f"rom={motion_result.details.get('avg_rom', 0):.2f}, "
           f"displacement={motion_result.details.get('avg_displacement', 0):.4f}")
 
-    # Step 3: StandardScaler
+    if motion_result.is_active:
+        features = trim_to_active_region(features)
+
+    raw_features_for_rf = features.copy()
+
     scaler = load_scaler(exercise_id)
     if scaler.n_features_in_ != features.shape[1]:
         print(f"[PIPELINE][{exercise_id}] WARNING: scaler expects {scaler.n_features_in_} features, got {features.shape[1]}")
     features_scaled = scaler.transform(features).astype(np.float32)
 
-    # Step 4: Pad/truncate to max_length
     if features_scaled.shape[0] > max_length:
         features_out = features_scaled[:max_length]
     else:
@@ -274,7 +388,7 @@ def prepare_data_with_motion(df, max_length, exercise_id):
     data = np.expand_dims(features_out, axis=0)
     data = np.nan_to_num(data, nan=MASK_VALUE)
 
-    return data, motion_result
+    return data, motion_result, raw_features_for_rf
 
 
 def test_model_inference(model, exercise_id, max_length):
@@ -292,7 +406,7 @@ def test_model_inference(model, exercise_id, max_length):
         np.zeros((300, len(cols)), dtype=np.float32),
         columns=cols,
     )
-    data_zeros, motion_zeros = prepare_data_with_motion(df_zeros, max_length, exercise_id)
+    data_zeros, motion_zeros, raw_zeros_rf = prepare_data_with_motion(df_zeros, max_length, exercise_id)
     pred_zeros = model.predict(data_zeros, verbose=0).flatten()
     raw_zeros = _auto_scale_score(pred_zeros[0])
     cal_zeros = calibrate_score(raw_zeros, motion_zeros)
@@ -341,7 +455,7 @@ def test_model_inference(model, exercise_id, max_length):
             standing[:, v_idx] = 0.8 + np.random.uniform(0, 0.2, n_frames)
 
     df_standing = pd.DataFrame(standing, columns=cols)
-    data_standing, motion_standing = prepare_data_with_motion(df_standing, max_length, exercise_id)
+    data_standing, motion_standing, raw_standing_rf = prepare_data_with_motion(df_standing, max_length, exercise_id)
     pred_standing = model.predict(data_standing, verbose=0).flatten()
     raw_standing = _auto_scale_score(pred_standing[0])
     cal_standing = calibrate_score(raw_standing, motion_standing)
@@ -375,7 +489,7 @@ def test_model_inference(model, exercise_id, max_length):
         arm_raise[i, rw_z_idx] -= raise_amount * 0.3
 
     df_arm = pd.DataFrame(arm_raise, columns=cols)
-    data_arm, motion_arm = prepare_data_with_motion(df_arm, max_length, exercise_id)
+    data_arm, motion_arm, raw_arm_rf = prepare_data_with_motion(df_arm, max_length, exercise_id)
     pred_arm = model.predict(data_arm, verbose=0).flatten()
     raw_arm = _auto_scale_score(pred_arm[0])
     cal_arm = calibrate_score(raw_arm, motion_arm)

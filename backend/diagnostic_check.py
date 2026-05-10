@@ -99,7 +99,7 @@ def check_inference(loaded_models):
     from ml_wrapper import prepare_data, get_dataframe_cols
     
     MAX_LENGTH_MAPPING = {
-        "Es1": 150, "Es2": 150, "Es3": 297, "Es4": 150, "Es5": 150,
+        "Es1": 150, "Es2": 150, "Es3": 150, "Es4": 150, "Es5": 150,
     }
     
     cols = get_dataframe_cols()

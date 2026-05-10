@@ -1,20 +1,104 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useLocation, useNavigate, Link } from 'react-router-dom';
-import * as tf from '@tensorflow/tfjs';
-import '@tensorflow/tfjs-backend-webgl';
-import * as poseDetection from '@tensorflow-models/pose-detection';
+import { useLocation, Link } from 'react-router-dom';
+import { PoseLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 import { MiniDataFrame } from './utils';
 import { RendererCanvas2d } from './renderer_canvas2d';
-import { csvToJSON } from './utils';
 import { api } from '../../api';
 
-// Keypoint dictionary
-const KEYPOINT_DICT = {
-    'nose': 0, 'left_eye': 1, 'right_eye': 2, 'left_ear': 3, 'right_ear': 4,
-    'left_shoulder': 5, 'right_shoulder': 6, 'left_elbow': 7, 'right_elbow': 8,
-    'left_wrist': 9, 'right_wrist': 10, 'left_hip': 11, 'right_hip': 12,
-    'left_knee': 13, 'right_knee': 14, 'left_ankle': 15, 'right_ankle': 16
+const BODY_LANDMARKS = {
+    'left_shoulder': 11, 'right_shoulder': 12,
+    'left_elbow': 13, 'right_elbow': 14,
+    'left_wrist': 15, 'right_wrist': 16,
+    'left_hip': 23, 'right_hip': 24,
+    'left_knee': 25, 'right_knee': 26,
+    'left_ankle': 27, 'right_ankle': 28,
 };
+
+/**
+ * CSV column order for 17 KiMoRe keypoints (y, x, confidence × 17 = 51 columns).
+ * Maps CSV column indices to the 12 BODY_LANDMARKS used by the renderer.
+ * Each body landmark has 3 values: (y, x, confidence).
+ */
+const CSV_BODY_COL_OFFSETS = {
+    // landmark_name: [y_col_offset, x_col_offset, confidence_col_offset]
+    // Keypoint index in CSV: nose(0), left_eye(1), right_eye(2), left_ear(3), right_ear(4),
+    //   left_shoulder(5), right_shoulder(6), left_elbow(7), right_elbow(8),
+    //   left_wrist(9), right_wrist(10), left_hip(11), right_hip(12),
+    //   left_knee(13), right_knee(14), left_ankle(15), right_ankle(16)
+    'left_shoulder': [15, 16, 17],   // keypoint 5: cols 15-17
+    'right_shoulder': [18, 19, 20],   // keypoint 6: cols 18-20
+    'left_elbow': [21, 22, 23],   // keypoint 7: cols 21-23
+    'right_elbow': [24, 25, 26],   // keypoint 8: cols 24-26
+    'left_wrist': [27, 28, 29],   // keypoint 9: cols 27-29
+    'right_wrist': [30, 31, 32],   // keypoint 10: cols 30-32
+    'left_hip': [33, 34, 35],   // keypoint 11: cols 33-35
+    'right_hip': [36, 37, 38],   // keypoint 12: cols 36-38
+    'left_knee': [39, 40, 41],   // keypoint 13: cols 39-41
+    'right_knee': [42, 43, 44],   // keypoint 14: cols 42-44
+    'left_ankle': [45, 46, 47],   // keypoint 15: cols 45-47
+    'right_ankle': [48, 49, 50],   // keypoint 16: cols 48-50
+};
+
+// Order matching BODY_LANDMARKS keys
+const BODY_LANDMARK_NAMES = [
+    'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+    'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+    'left_knee', 'right_knee', 'left_ankle', 'right_ankle',
+];
+
+/**
+ * Parse reference CSV text and extract 12 body landmarks from a representative frame.
+ * CSV format: 17 keypoints × 3 (y, x, confidence) = 51 columns, ~520 rows.
+ * @param {string} csvText - Raw CSV text
+ * @param {number} frameIndex - Frame index to extract (default: middle frame)
+ * @returns {Array<{x: number, y: number, confidence: number}>} 12 landmarks in BODY_LANDMARK_NAMES order
+ */
+function extractReferencePoseFromCSV(csvText, frameIndex = null) {
+    const lines = csvText.trim().split('\n');
+    if (lines.length < 2) return null;
+
+    // Skip header row, pick middle frame if not specified
+    const dataLines = lines.slice(1);
+    const idx = frameIndex !== null ? frameIndex : Math.floor(dataLines.length / 2);
+    const safeIdx = Math.min(idx, dataLines.length - 1);
+    const row = dataLines[safeIdx].split(',').map(Number);
+
+    if (row.length < 51) {
+        console.warn('[extractReferencePose] CSV row has fewer than 51 columns:', row.length);
+        return null;
+    }
+
+    const landmarks = [];
+    for (const name of BODY_LANDMARK_NAMES) {
+        const [yCol, xCol, confCol] = CSV_BODY_COL_OFFSETS[name];
+        landmarks.push({
+            x: row[xCol],
+            y: row[yCol],
+            confidence: row[confCol],
+        });
+    }
+    return landmarks;
+}
+
+/**
+ * Compute confidence level from quality_factor and motion_energy.
+ * Returns {level: 'high'|'medium'|'low'|'none', color: string, label: string}
+ */
+function computeConfidenceDisplay(qualityFactor, motionEnergy, motionDetected) {
+    if (!motionDetected || qualityFactor === null) {
+        return { level: 'none', color: 'bg-gray-400', textColor: 'text-gray-500', label: 'No motion' };
+    }
+    // quality_factor is [0.1, 1.0], motion_energy is [0, 1]
+    // Composite confidence: weighted combination
+    const confidence = qualityFactor * 0.7 + (motionEnergy || 0) * 0.3;
+    if (confidence >= 0.6) {
+        return { level: 'high', color: 'bg-[#6ABE4E]', textColor: 'text-[#6ABE4E]', label: 'High' };
+    } else if (confidence >= 0.3) {
+        return { level: 'medium', color: 'bg-amber-400', textColor: 'text-amber-500', label: 'Medium' };
+    } else {
+        return { level: 'low', color: 'bg-red-400', textColor: 'text-red-500', label: 'Low' };
+    }
+}
 
 export default function Exercise() {
     const location = useLocation();
@@ -25,47 +109,39 @@ export default function Exercise() {
     const referenceVideoRef = useRef(null);
     const reqAFRef = useRef(null);
 
-    // AI Refs to avoid re-rendering
-    const movenetRef = useRef(null);
+    const poseLandmarkerRef = useRef(null);
     const rendererRef = useRef(null);
-    const referenceDFRef = useRef(null);
 
-    // Performance: Use array instead of pandas-js dataframe for 60FPS pushes
     const framesRef = useRef([]);
 
-    // State
     const [isSaving, setIsSaving] = useState(false);
     const [isExerciseFinished, setIsExerciseFinished] = useState(false);
     const [countdown, setCountdown] = useState(null);
     const [elapsedTime, setElapsedTime] = useState(0);
-    const [feedbackMessages, setFeedbackMessages] = useState([]);
-    const [currentFeedbackMessages, setCurrentFeedbackMessages] = useState([]);
     const [clinicalScore, setClinicalScore] = useState(null);
-    const [liveScore, setLiveScore] = useState(null);
-    const [feedbackLatency, setFeedbackLatency] = useState(null);
     const [motionDetected, setMotionDetected] = useState(null);
     const [motionEnergy, setMotionEnergy] = useState(null);
+    const [qualityFactor, setQualityFactor] = useState(null);
+    const [isScoring, setIsScoring] = useState(false);
+    const [rawScore, setRawScore] = useState(null);
 
     const [videoLoaded, setVideoLoaded] = useState(false);
     const isSavingRef = useRef(false);
-    const wsRef = useRef(null);
-    const progressiveScoreIntervalRef = useRef(null);
+    const lastTimestampRef = useRef(-1);
 
     useEffect(() => {
         isSavingRef.current = isSaving;
     }, [isSaving]);
 
-    // Initialization
     useEffect(() => {
         if (!exerciseInfo) return;
 
         let isMounted = true;
         const initCameraAndAI = async () => {
-            // 1. Setup Camera
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
                     audio: false,
-                    video: { facingMode: 'user', width: 640, height: 480, frameRate: { ideal: 30 } }
+                    video: { facingMode: 'user', frameRate: { ideal: 30 } }
                 });
                 if (videoRef.current) {
                     videoRef.current.srcObject = stream;
@@ -78,21 +154,30 @@ export default function Exercise() {
                 console.error("Camera error", e);
             }
 
-            // 2. Setup TFJS & MoveNet
-            await tf.setBackend('webgl');
-            await tf.ready();
-            // Performance Fix: Use LIGHTNING model for real-time smoothness
-            const detectorConfig = { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING };
-            movenetRef.current = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+            );
+            poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+                    delegate: "GPU",
+                },
+                runningMode: "VIDEO",
+                numPoses: 1,
+            });
+
             if (canvasRef.current) {
                 rendererRef.current = new RendererCanvas2d(canvasRef.current);
             }
 
-            // 3. Load Reference Data
+            // Load reference CSV → extract representative frame → set silhouette
             try {
                 const response = await fetch(exerciseInfo.csv);
                 const csvText = await response.text();
-                referenceDFRef.current = new MiniDataFrame(csvToJSON(csvText));
+                const refPose = extractReferencePoseFromCSV(csvText);
+                if (refPose && rendererRef.current) {
+                    rendererRef.current.setReferencePose(refPose);
+                }
             } catch (e) { console.error("CSV loading error", e); }
 
             if (isMounted) detectPose();
@@ -106,58 +191,81 @@ export default function Exercise() {
             if (videoRef.current && videoRef.current.srcObject) {
                 videoRef.current.srcObject.getTracks().forEach(t => t.stop());
             }
+            if (poseLandmarkerRef.current) {
+                poseLandmarkerRef.current.close();
+            }
         };
     }, [exerciseInfo]);
 
-    // 4. The Pose Detection Loop
     const detectPose = () => {
-        const videoWidth = 640, videoHeight = 480;
-
         const findPose = async () => {
-            if (!videoRef.current || !movenetRef.current || !canvasRef.current || videoRef.current.readyState !== 4) {
+            if (!videoRef.current || !poseLandmarkerRef.current || !canvasRef.current || videoRef.current.readyState !== 4) {
                 reqAFRef.current = requestAnimationFrame(findPose);
                 return;
             }
 
             const video = videoRef.current;
             const canvas = canvasRef.current;
+            const videoWidth = video.videoWidth;
+            const videoHeight = video.videoHeight;
+
             if (canvas.width !== videoWidth) {
                 canvas.width = videoWidth;
                 canvas.height = videoHeight;
+                if (rendererRef.current) {
+                    rendererRef.current.videoWidth = videoWidth;
+                    rendererRef.current.videoHeight = videoHeight;
+                    rendererRef.current.invalidateSilhouetteCache();
+                }
             }
             const ctx = canvas.getContext('2d');
 
-            const poses = await movenetRef.current.estimatePoses(video, { flipHorizontal: false, flipVertical: false });
+            const nowMs = performance.now();
+            if (nowMs <= lastTimestampRef.current) {
+                reqAFRef.current = requestAnimationFrame(findPose);
+                return;
+            }
+            lastTimestampRef.current = nowMs;
 
-            if (isSavingRef.current && poses[0]) {
-                const normalizedKeypoints = poseDetection.calculators.keypointsToNormalizedKeypoints(
-                    poses[0].keypoints,
-                    { width: video.videoWidth || videoWidth, height: video.videoHeight || videoHeight }
-                );
+            const result = poseLandmarkerRef.current.detectForVideo(video, nowMs);
+
+            // Record frame data when session is active
+            if (isSavingRef.current && result.landmarks && result.landmarks.length > 0) {
+                const landmarks = result.landmarks[0];
+
+                const TARGET_AR = 16 / 9;
+                const actualAR = videoWidth / videoHeight;
+                const xCorrectionFactor = actualAR / TARGET_AR;
 
                 const frameData = {};
-                for (const [jointName, jointIndex] of Object.entries(KEYPOINT_DICT)) {
-                    const keypoint = normalizedKeypoints[jointIndex];
-                    if (keypoint) {
-                        frameData[jointName + '_x'] = keypoint.x;
-                        frameData[jointName + '_y'] = keypoint.y;
-                        frameData[jointName + '_confidence'] = keypoint.score;
+                for (const [jointName, landmarkIndex] of Object.entries(BODY_LANDMARKS)) {
+                    const lm = landmarks[landmarkIndex];
+                    if (lm) {
+                        frameData[jointName + '_x'] = lm.x * xCorrectionFactor;
+                        frameData[jointName + '_y'] = lm.y;
+                        frameData[jointName + '_z'] = lm.z;
+                        frameData[jointName + '_v'] = lm.visibility ?? 1.0;
                     }
                 }
                 framesRef.current.push(frameData);
-
-                // Every 30 frames, do DTW comparison
-                if (framesRef.current.length % 30 === 0 && referenceDFRef.current) {
-                    compareJointsWithReference(framesRef.current);
-                }
             }
 
+            // Rendering order: video → silhouette → user skeleton
             ctx.clearRect(0, 0, videoWidth, videoHeight);
             ctx.save();
             ctx.scale(-1, 1);
             ctx.translate(-videoWidth, 0);
             ctx.drawImage(video, 0, 0, videoWidth, videoHeight);
-            if (rendererRef.current && poses.length > 0) rendererRef.current.drawResults(poses);
+
+            // Draw silhouette overlay (translucent reference pose)
+            if (rendererRef.current) {
+                rendererRef.current.drawSilhouette(0.2);
+            }
+
+            // Draw user skeleton on top
+            if (rendererRef.current && result.landmarks && result.landmarks.length > 0) {
+                rendererRef.current.drawResults(result.landmarks);
+            }
             ctx.restore();
 
             reqAFRef.current = requestAnimationFrame(findPose);
@@ -165,115 +273,8 @@ export default function Exercise() {
         findPose();
     };
 
-    // 5. WebSocket-based feedback (replaces REST polling for lower latency)
-    const connectWebSocket = (exerciseId) => {
-        const baseUrl = (import.meta.env.VITE_API_URL || 'http://localhost:8000')
-            .replace(/^http/, 'ws');
-        const ws = new WebSocket(`${baseUrl}/ws/session/${exerciseId}`);
-
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (data.type === 'feedback') {
-                handleFeedbackResponse(data);
-                if (data.latency_ms) setFeedbackLatency(data.latency_ms);
-            } else if (data.type === 'clinical_score') {
-                setLiveScore(data.score);
-                if (data.motion_detected !== undefined) setMotionDetected(data.motion_detected);
-                if (data.motion_energy !== undefined) setMotionEnergy(data.motion_energy);
-            } else if (data.type === 'error') {
-                console.error('WebSocket error:', data.message);
-            }
-        };
-
-        ws.onerror = (e) => console.error('WebSocket connection error:', e);
-        ws.onclose = () => console.log('WebSocket closed');
-        wsRef.current = ws;
-    };
-
-    const disconnectWebSocket = () => {
-        if (wsRef.current) {
-            wsRef.current.close();
-            wsRef.current = null;
-        }
-    };
-
-    const handleFeedbackResponse = (data) => {
-        let newFeedback = [];
-        if (data.feedback_details) {
-            for (const item of data.feedback_details) {
-                if (item.status === 'needs_correction') {
-                    newFeedback.push({
-                        message: item.message,
-                        joint: item.joint_group,
-                        severity: item.severity,
-                    });
-                }
-            }
-        }
-
-        if (data.primary_instruction && newFeedback.length > 0) {
-            newFeedback.unshift({ message: data.primary_instruction, severity: 1 });
-        }
-
-        if (newFeedback.length > 0) {
-            setCurrentFeedbackMessages(newFeedback);
-            setFeedbackMessages(prev => [...prev, ...newFeedback]);
-        } else {
-            setCurrentFeedbackMessages([]);
-        }
-    };
-
-    const buildKeypointArray = (frameData) => {
-        const KEYPOINT_ORDER = [
-            'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
-            'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
-            'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
-            'left_knee', 'right_knee', 'left_ankle', 'right_ankle',
-        ];
-        const values = [];
-        for (const name of KEYPOINT_ORDER) {
-            values.push(frameData[name + '_y'] ?? 0);
-            values.push(frameData[name + '_x'] ?? 0);
-            values.push(frameData[name + '_confidence'] ?? 0);
-        }
-        return values;
-    };
-
-    const compareJointsWithReference = async (framesArray) => {
-        if (!referenceDFRef.current) return;
-        const currentFrameIndex = framesArray.length - 1;
-
-        const currentFrame = framesArray[currentFrameIndex];
-        const currentJointValues = buildKeypointArray(currentFrame);
-
-        const refData = referenceDFRef.current.data;
-        const refIndex = Math.min(currentFrameIndex, refData.length - 1);
-        const refFrame = refData[refIndex];
-        const referenceJointValues = buildKeypointArray(refFrame);
-
-        // Use WebSocket if available, fallback to REST
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({
-                type: 'feedback',
-                referenceJointValues,
-                currentJointValues,
-            }));
-        } else {
-            // REST fallback
-            try {
-                const response = await api.post(`/api/feedback/${exerciseInfo.exercise_id}/`, {
-                    referenceJointValues,
-                    currentJointValues,
-                    includeDtw: false,
-                });
-                handleFeedbackResponse(response.data);
-            } catch (e) {
-                console.error('Feedback API error:', e);
-            }
-        }
-    };
-
     const fetchClinicalScore = async () => {
+        setIsScoring(true);
         try {
             const finalDF = new MiniDataFrame(framesRef.current);
             const response = await api.post(`/api/clinical_score/${exerciseInfo?.exercise_id}`, {
@@ -281,22 +282,42 @@ export default function Exercise() {
             });
             if (response.data) {
                 setClinicalScore(response.data.clinical_score[0][0]);
+                setRawScore(response.data.raw_score || null);
                 if (response.data.motion_detected !== undefined) setMotionDetected(response.data.motion_detected);
                 if (response.data.motion_energy !== undefined) setMotionEnergy(response.data.motion_energy);
+                if (response.data.quality_factor !== undefined) setQualityFactor(response.data.quality_factor);
             }
         } catch (e) { console.error(e); }
+        setIsScoring(false);
     };
 
-    // 6. Triggers 
     const timerIntervalRef = useRef(null);
     const exerciseTimerRef = useRef(null);
+    const countdownIntervalRef = useRef(null);
+
+    const clearAllTimers = () => {
+        if (countdownIntervalRef.current) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+        }
+        if (timerIntervalRef.current) {
+            clearInterval(timerIntervalRef.current);
+            timerIntervalRef.current = null;
+        }
+        if (exerciseTimerRef.current) {
+            clearTimeout(exerciseTimerRef.current);
+            exerciseTimerRef.current = null;
+        }
+    };
 
     const startExerciseCountDown = () => {
+        clearAllTimers();
         setCountdown(10);
-        const inv = setInterval(() => {
+        countdownIntervalRef.current = setInterval(() => {
             setCountdown(c => {
                 if (c <= 1) {
-                    clearInterval(inv);
+                    clearInterval(countdownIntervalRef.current);
+                    countdownIntervalRef.current = null;
                     startExerciseSession();
                     return null;
                 }
@@ -306,20 +327,18 @@ export default function Exercise() {
     };
 
     const startExerciseSession = () => {
+        clearAllTimers();
+
         setIsSaving(true);
         setIsExerciseFinished(false);
         framesRef.current = [];
         setElapsedTime(0);
-        setCurrentFeedbackMessages([]);
-        setFeedbackMessages([]);
         setClinicalScore(null);
-        setLiveScore(null);
-        setFeedbackLatency(null);
+        setRawScore(null);
         setMotionDetected(null);
         setMotionEnergy(null);
-
-        // Connect WebSocket for real-time feedback
-        connectWebSocket(exerciseInfo.exercise_id);
+        setQualityFactor(null);
+        setIsScoring(false);
 
         if (referenceVideoRef.current) {
             referenceVideoRef.current.currentTime = 0;
@@ -327,35 +346,19 @@ export default function Exercise() {
         }
 
         const startTimestamp = Date.now();
-        // Performance Fix: decouple stopwatch from 60FPS react re-renders
         timerIntervalRef.current = setInterval(() => {
             setElapsedTime((Date.now() - startTimestamp) / 1000);
         }, 500);
 
-        // Progressive clinical score: request score every 5 seconds
-        progressiveScoreIntervalRef.current = setInterval(() => {
-            if (framesRef.current.length > 30 && wsRef.current?.readyState === WebSocket.OPEN) {
-                const partialDF = new MiniDataFrame(framesRef.current);
-                wsRef.current.send(JSON.stringify({
-                    type: 'clinical_score',
-                    csvString: partialDF.to_csv(),
-                }));
-            }
-        }, 5000);
-
         exerciseTimerRef.current = setTimeout(() => {
             stopExerciseSession();
-        }, 30000); // Wait 30s
+        }, 30000);
     };
 
     const stopExerciseSession = () => {
         setIsSaving(false);
-        if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-        if (exerciseTimerRef.current) clearTimeout(exerciseTimerRef.current);
-        if (progressiveScoreIntervalRef.current) clearInterval(progressiveScoreIntervalRef.current);
+        clearAllTimers();
         if (referenceVideoRef.current) referenceVideoRef.current.pause();
-
-        disconnectWebSocket();
 
         setIsExerciseFinished(true);
         fetchClinicalScore();
@@ -363,10 +366,11 @@ export default function Exercise() {
 
     if (!exerciseInfo) return <div>No Exercise Data Provided. Please Navigate back.</div>;
 
-    // Formatting 
-    const isReady = videoLoaded; // camera is on
+    const isReady = videoLoaded;
     const timeLeft = 30 - Math.floor(elapsedTime);
     let displayTime = isSaving ? `00:${timeLeft < 10 ? '0' + timeLeft : timeLeft}` : "00:00";
+
+    const confidence = computeConfidenceDisplay(qualityFactor, motionEnergy, motionDetected);
 
     return (
         <div className="bg-background text-on-background min-h-screen pb-20 font-['Inter']">
@@ -437,6 +441,11 @@ export default function Exercise() {
                                         </div>
                                     </div>
                                 )}
+                                {/* Silhouette guide label */}
+                                <div className="absolute top-4 right-4 px-3 py-1 bg-white/80 backdrop-blur-sm rounded-full text-[10px] font-bold text-primary flex items-center gap-1">
+                                    <span className="material-symbols-outlined text-[14px]">person</span>
+                                    Follow the green outline
+                                </div>
                             </div>
                         </div>
 
@@ -455,26 +464,35 @@ export default function Exercise() {
                         </div>
                     </div>
 
-                    {/* Bottom Row: Instructions & Feedback Sidebar */}
+                    {/* Bottom Row: Stats & Session Info */}
                     <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-8 mt-2">
                         {/* Stats Column */}
                         <div className="flex flex-col gap-6">
-                            {/* Progress & Stats Card */}
+                            {/* Clinical Score Card */}
                             <div className="bg-surface-container-lowest p-6 rounded-lg shadow-[0_20px_40px_rgba(21,49,40,0.04)]">
                                 <div className="flex justify-between items-center mb-6">
                                     <div>
                                         <p className="text-[10px] uppercase tracking-[0.1em] font-bold text-on-surface-variant mb-1">Clinical Score</p>
-                                        <p className="text-3xl font-extrabold text-primary">
-                                            {clinicalScore !== null
-                                                ? Number(clinicalScore).toFixed(0)
-                                                : liveScore !== null
-                                                    ? <span className="animate-pulse">{Number(liveScore).toFixed(0)}</span>
-                                                    : "--"}
-                                            <span className="text-sm font-medium text-on-surface-variant ml-1">/100</span>
-                                        </p>
-                                        {feedbackLatency !== null && isSaving && (
+                                        <div className="flex items-baseline gap-3">
+                                            <p className="text-3xl font-extrabold text-primary">
+                                                {isScoring
+                                                    ? <span className="animate-pulse text-on-surface-variant">Đang chấm...</span>
+                                                    : clinicalScore !== null
+                                                        ? Number(clinicalScore).toFixed(0)
+                                                        : "--"}
+                                                <span className="text-sm font-medium text-on-surface-variant ml-1">/50</span>
+                                            </p>
+                                            {/* Model Confidence Badge */}
+                                            {clinicalScore !== null && !isScoring && (
+                                                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${confidence.color} text-white`}>
+                                                    {confidence.label} confidence
+                                                </span>
+                                            )}
+                                        </div>
+                                        {/* Raw vs Calibrated score breakdown */}
+                                        {clinicalScore !== null && rawScore !== null && !isScoring && (
                                             <p className="text-[9px] text-on-surface-variant mt-1">
-                                                {feedbackLatency.toFixed(0)}ms latency
+                                                Raw: {Number(rawScore).toFixed(1)} → Calibrated: {Number(clinicalScore).toFixed(1)}
                                             </p>
                                         )}
                                     </div>
@@ -487,19 +505,6 @@ export default function Exercise() {
                                 <div className="h-2 w-full bg-surface-container rounded-full overflow-hidden">
                                     <div className="h-full bg-[#6ABE4E] rounded-full transition-all duration-500" style={{ width: `${Math.min(100, (elapsedTime / 30) * 100)}%` }}></div>
                                 </div>
-
-                                {/* Live Motion Energy Indicator */}
-                                {isSaving && motionEnergy !== null && (
-                                    <div className="flex items-center gap-3 mt-3 px-1">
-                                        <span className="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant whitespace-nowrap">Motion Level</span>
-                                        <div className="h-1.5 flex-1 bg-surface-container rounded-full overflow-hidden">
-                                            <div className={`h-full rounded-full transition-all duration-700 ${motionEnergy > 0.5 ? 'bg-[#6ABE4E]' : motionEnergy > 0.2 ? 'bg-amber-400' : 'bg-red-400'
-                                                }`} style={{ width: `${Math.min(100, motionEnergy * 100)}%` }}></div>
-                                        </div>
-                                        <span className={`text-[10px] font-bold ${motionDetected ? 'text-[#6ABE4E]' : 'text-amber-500'
-                                            }`}>{motionDetected ? 'Active' : 'Low'}</span>
-                                    </div>
-                                )}
                             </div>
 
                             {/* Secondary Actions */}
@@ -515,48 +520,52 @@ export default function Exercise() {
                             )}
                         </div>
 
-                        {/* Feedback Column */}
+                        {/* Session Info Column */}
                         <div className="flex flex-col gap-6">
-                            {/* Live Feedback Cards */}
-                            <div className="flex flex-col gap-4">
-                                <h3 className="text-sm font-bold uppercase tracking-widest text-on-surface-variant px-1">Real-time Guidance</h3>
-
-                                {isSaving && currentFeedbackMessages.length === 0 && (
-                                    <div className="bg-[#B0D182]/20 border-l-4 border-[#6ABE4E] p-4 rounded-lg flex items-start gap-4">
-                                        <span className="material-symbols-outlined text-[#6ABE4E]" style={{ fontVariationSettings: "'FILL' 1" }}>check_circle</span>
-                                        <div>
-                                            <p className="font-bold text-[#153128]">Perfect Alignment</p>
-                                            <p className="text-sm text-on-surface-variant mt-1">Movement matches reference frame optimally.</p>
-                                        </div>
+                            {/* Silhouette Guide Card (before exercise starts) */}
+                            {!isSaving && !clinicalScore && !isScoring && (
+                                <div className="bg-surface-container-low p-4 rounded-lg flex items-start gap-4">
+                                    <span className="material-symbols-outlined text-primary mt-0.5">visibility</span>
+                                    <div>
+                                        <p className="font-bold text-primary text-sm">Position Guide</p>
+                                        <p className="text-sm text-on-surface-variant mt-1">
+                                            A green silhouette outline will appear on your camera feed.
+                                            Match your body position to the outline for optimal exercise form.
+                                        </p>
                                     </div>
-                                )}
+                                </div>
+                            )}
 
-                                {currentFeedbackMessages.map((msg, i) => (
-                                    <div key={i} className="bg-surface-variant/50 p-4 rounded-lg flex items-start gap-4 border-l-4 border-amber-500">
-                                        <span className="material-symbols-outlined text-amber-500">info</span>
-                                        <div>
-                                            <p className="font-bold text-primary">Adjustment Needed</p>
-                                            <p className="text-sm text-on-surface-variant mt-1">{msg.message}</p>
-                                        </div>
-                                    </div>
-                                ))}
+                            {/* Motion & Confidence Details (after scoring) */}
+                            {clinicalScore !== null && (
+                                <div className="p-4 rounded-lg flex items-start gap-4 border-l-4 bg-secondary-container/50 border-secondary">
+                                    <span className="material-symbols-outlined text-secondary" style={{ fontVariationSettings: "'FILL' 1" }}>
+                                        verified
+                                    </span>
+                                    <div className="flex-1">
+                                        <p className="font-bold text-primary">Session Finished</p>
+                                        <p className="text-sm text-on-surface-variant mt-1">Tuyệt vời! Điểm lâm sàng đã được ghi nhận.</p>
 
-                                {!isSaving && !clinicalScore && (
-                                    <div className="bg-surface-container-low p-4 rounded-lg text-sm text-on-surface-variant">
-                                        Start the exercise to receive live AI posture feedback.
-                                    </div>
-                                )}
-                                {clinicalScore !== null && (
-                                    <div className="p-4 rounded-lg flex items-start gap-4 border-l-4 bg-secondary-container/50 border-secondary">
-                                        <span className="material-symbols-outlined text-secondary" style={{ fontVariationSettings: "'FILL' 1" }}>
-                                            verified
-                                        </span>
-                                        <div>
-                                            <p className="font-bold text-primary">Session Finished</p>
-                                            <p className="text-sm text-on-surface-variant mt-1">Tuyệt vời! Điểm lâm sàng đã được ghi nhận.</p>
+                                        {/* Confidence & Motion Details */}
+                                        <div className="mt-3 space-y-2">
+                                            {/* Model Confidence */}
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant w-20">Confidence</span>
+                                                <div className={`w-2 h-2 rounded-full ${confidence.color}`}></div>
+                                                <span className={`text-[11px] font-semibold ${confidence.textColor}`}>
+                                                    {confidence.label}
+                                                </span>
+                                                {qualityFactor !== null && (
+                                                    <span className="text-[10px] text-on-surface-variant ml-1">
+                                                        (Q: {qualityFactor.toFixed(2)})
+                                                    </span>
+                                                )}
+                                            </div>
+
+                                            {/* Motion Energy Bar */}
                                             {motionEnergy !== null && (
-                                                <div className="mt-2 flex items-center gap-2">
-                                                    <span className="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant">Motion</span>
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant w-20">Motion</span>
                                                     <div className="h-1.5 w-20 bg-surface-container rounded-full overflow-hidden">
                                                         <div className={`h-full rounded-full transition-all ${motionEnergy > 0.5 ? 'bg-[#6ABE4E]' : motionEnergy > 0.2 ? 'bg-amber-400' : 'bg-red-400'
                                                             }`} style={{ width: `${Math.min(100, motionEnergy * 100)}%` }}></div>
@@ -566,8 +575,8 @@ export default function Exercise() {
                                             )}
                                         </div>
                                     </div>
-                                )}
-                            </div>
+                                </div>
+                            )}
                         </div>
                     </div>
                 </div>

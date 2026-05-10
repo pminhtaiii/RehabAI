@@ -1,4 +1,4 @@
-## tables for sqlite application
+"""Database models for RehabAI SQLite application."""
 
 # Importing necessary libraries
 from datetime import datetime

@@ -58,3 +58,6 @@ brain/
 # Temporary files & local logs
 backend_logs*.txt
 bt*.c
+
+# Embedded skills
+skills/

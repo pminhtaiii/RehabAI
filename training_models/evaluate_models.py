@@ -1,17 +1,4 @@
-"""
-RehabAI Model Evaluation: Transformer vs LSTM
-==============================================
-Compares existing Transformer architecture against an LSTM baseline
-using identical data splits, preprocessing, and evaluation metrics.
-
-Usage (Colab):
-    1. Mount Google Drive
-    2. Set DATA_CSV_PATH to your KiMoRe CSV
-    3. Run all cells
-
-Usage (Local):
-    python evaluate_models.py --exercise Es1 --data_csv /path/to/KiMoRe_data_movenet_features.csv
-"""
+"""Model evaluation for clinical score prediction."""
 
 import os
 import json
@@ -26,6 +13,28 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy.stats import pearsonr, spearmanr
+
+import tensorflow as tf
+import tensorflow.keras.backend as K
+
+def ccc_loss(y_true, y_pred):
+    """Concordance Correlation Coefficient Loss.
+    Forces the model to match both the mean AND the variance of the true scores,
+    preventing the model from collapsing predictions to the dataset mean (46).
+    """
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    mean_true = K.mean(y_true)
+    mean_pred = K.mean(y_pred)
+    
+    var_true = K.var(y_true)
+    var_pred = K.var(y_pred)
+    
+    covar = K.mean((y_true - mean_true) * (y_pred - mean_pred))
+    
+    ccc = (2.0 * covar) / (var_true + var_pred + K.square(mean_true - mean_pred) + K.epsilon())
+    return 1.0 - ccc
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -225,13 +234,13 @@ def evaluate_model_cv(model_builder, data, labels, masks, model_type, exercise,
                 num_windows=tw[0], window_size=tw[1],
             )
             base.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-                         loss='mse', metrics=['mae'])
+                         loss=ccc_loss, metrics=['mae', 'mse'])
             train_inputs = [X_train, m_train]
             val_inputs = [X_val, m_val]
         else:  # LSTM
             base = model_builder(input_shape=(data.shape[1], data.shape[2]))
             base.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-                         loss='mse', metrics=['mae'])
+                         loss=ccc_loss, metrics=['mae', 'mse'])
             train_inputs = X_train
             val_inputs = X_val
 

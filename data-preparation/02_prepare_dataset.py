@@ -1,18 +1,7 @@
-"""
-02_prepare_dataset.py — Build master metadata CSV from MediaPipe 3D joints
-==========================================================================
-Scans 03_raw_joints/ for MediaPipe CSV files produced by 01_extract_joint_positions.py,
-matches them with clinical scores from 02_clinical_labels/, and writes
-KiMoRe_final.csv for downstream use by 03_extract_joint_features.py.
+"""Build master metadata CSV from MediaPipe 3D joint positions.
 
-Pipeline:  01_extract_joint_positions.py → [this file] → 03_extract_joint_features.py
-
-Output CSV columns:
-  ID, clinical_group, expertise, exercise, video, joint_positions, clinical_score, #frames
-
-Usage:
-  Colab:  Change BASE_DIR to '/content/drive/MyDrive/RehabAI' and run
-  Local:  python 02_prepare_dataset.py
+Scans extracted joint CSV files, matches with clinical labels,
+and writes combined dataset for feature extraction.
 """
 
 import os
@@ -20,10 +9,7 @@ import glob
 import pandas as pd
 import numpy as np
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-# Change this to match your environment:
-#   Colab:  '/content/drive/MyDrive/RehabAI'
-#   Local:  'C:/RehabAI'
+
 BASE_DIR = 'C:/RehabAI'
 
 JOINTS_DIR = f'{BASE_DIR}/03_raw_joints'

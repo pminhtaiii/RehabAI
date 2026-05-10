@@ -32,7 +32,7 @@ from io import StringIO
 
 from database import SessionLocal, engine
 from hashing import get_hashed_password, verify_password
-from ml_wrapper import prepare_data, prepare_data_with_motion, reorder_dataframe, get_dataframe_cols, load_scaler, test_model_inference
+from ml_wrapper import prepare_data, prepare_data_with_motion, reorder_dataframe, get_dataframe_cols, load_scaler, test_model_inference, load_rf_model, load_model_config, extract_summary_features, predict_ensemble
 from motion_detector import calibrate_score
 from data_wrapper import initialize_db
 from feedback_engine import generate_feedback
@@ -52,7 +52,7 @@ MODELS_DIRECTORY = "models/"
 MAX_LENGTH_MAPPING = {
     "Es1": 150,
     "Es2": 150,
-    "Es3": 297,
+    "Es3": 150,
     "Es4": 150,
     "Es5": 150,
 }
@@ -138,8 +138,11 @@ async def lifespan(app: FastAPI):
                 f"[startup] WARNING: No model file found for {exercise_id} "
                 f"(checked default and _best .keras/.h5 names)"
             )
+
+        load_rf_model(exercise_id)
+        load_model_config(exercise_id)
+
     yield
-    # Cleanup on shutdown
     ml_models_cache.clear()
     model_load_errors.clear()
     print("[shutdown] ML models released.")
@@ -212,9 +215,13 @@ class FeedbackRequest(BaseModel):
     includeDtw: bool = False
 
 
-def _predict_clinical_score_from_csv(csv_string: str, max_length: int, exercise_id: str, model):
+def _predict_clinical_score_from_csv(csv_string: str, max_length: int, exercise_id: str, model, source: str = "webcam"):
     """CPU-bound preprocessing + inference for clinical score endpoint.
-    
+
+    Args:
+        source: "video" for offline KiMoRe (25fps), "webcam" for live (30fps).
+                Affects temporal downsampling stride to match training fps.
+
     Returns dict with raw_score, calibrated_score, and motion metrics.
     """
     csv_string_io = StringIO(csv_string)
@@ -231,8 +238,8 @@ def _predict_clinical_score_from_csv(csv_string: str, max_length: int, exercise_
     print(f"[DEBUG][{exercise_id}] After reorder: NaN count={nan_after_reorder}")
 
     # Use motion-aware preparation pipeline
-    prepared_data, motion_result = prepare_data_with_motion(
-        raw_data_ordered, max_length, exercise_id
+    prepared_data, motion_result, raw_features_for_rf = prepare_data_with_motion(
+        raw_data_ordered, max_length, exercise_id, source=source
     )
 
     expected_tail = _get_model_input_tail_shape(model)
@@ -245,26 +252,38 @@ def _predict_clinical_score_from_csv(csv_string: str, max_length: int, exercise_
     raw_prediction = model.predict(prepared_data, verbose=0)
     raw_out = float(raw_prediction.flatten()[0])
 
-    # Auto-detect normalization: v5 models output [0,1] (trained with y/50),
-    # older models output [0,50] directly (no normalization).
-    # If output ≤ 1.5, assume normalized → un-normalize ×50.
-    # If output > 1.5, assume raw [0,50] → use directly.
     if raw_out <= 1.5:
-        raw_ts = raw_out * 50.0  # un-normalize from [0,1] to [0,50]
+        lstm_score = raw_out * 50.0
     else:
-        raw_ts = raw_out         # already in [0,50] range
-    raw_score = float(np.clip(raw_ts, 0, 50) * 2.0)
+        lstm_score = raw_out
+    lstm_score = float(np.clip(lstm_score, 0, 50))
 
-    # --- DEBUG: Model output ---
-    print(f"[DEBUG][{exercise_id}] Raw model output: {raw_prediction.flatten()}")
-    print(f"[DEBUG][{exercise_id}] Raw score (0-100): {raw_score:.2f}")
+    rf_model = load_rf_model(exercise_id)
+    model_config = load_model_config(exercise_id)
+    alpha = model_config.get("ensemble_alpha", 0.5)
+
+    if rf_model is not None:
+        rf_input = extract_summary_features(raw_features_for_rf)
+        rf_score = float(rf_model.predict(rf_input)[0])
+        rf_score = float(np.clip(rf_score, 0, 50))
+        raw_score = predict_ensemble(lstm_score, rf_score, alpha)
+        print(f"[ENSEMBLE][{exercise_id}] LSTM={lstm_score:.2f}, RF={rf_score:.2f}, "
+              f"alpha={alpha:.2f}, blended={raw_score:.2f}")
+    else:
+        raw_score = lstm_score
+        print(f"[ENSEMBLE][{exercise_id}] RF not available, LSTM-only={lstm_score:.2f}")
+
     print(f"[DEBUG][{exercise_id}] Motion active={motion_result.is_active}, "
           f"energy={motion_result.motion_energy:.3f}, "
           f"quality_factor={motion_result.quality_factor:.3f}")
 
     return {
         "raw_score": round(raw_score, 2),
-        "calibrated_score": round(raw_score, 2),  # Use raw score directly — model already discriminates
+        "calibrated_score": calibrate_score(raw_score, motion_result),
+        "ensemble_alpha": alpha,
+        "rf_available": rf_model is not None,
+        "lstm_score": round(lstm_score, 2),
+        "rf_score": round(rf_score, 2) if rf_model is not None else None,
         "motion_detected": motion_result.is_active,
         "motion_energy": motion_result.motion_energy,
         "quality_factor": motion_result.quality_factor,
@@ -274,6 +293,28 @@ def _predict_clinical_score_from_csv(csv_string: str, max_length: int, exercise_
             "displacement_score": motion_result.frame_displacement_score,
         },
     }
+
+
+@app.get("/api/health")
+async def health_check():
+    models_status = {}
+    for ex_id in ["Es1", "Es2", "Es3", "Es4", "Es5"]:
+        rf_model = load_rf_model(ex_id)
+        model_config = load_model_config(ex_id)
+        models_status[ex_id] = {
+            "model_loaded": ex_id in ml_models_cache,
+            "rf_loaded": rf_model is not None,
+            "ensemble_alpha": model_config.get("ensemble_alpha", 0.5),
+            "error": model_load_errors.get(ex_id),
+        }
+    all_loaded = all(s["model_loaded"] for s in models_status.values())
+    return JSONResponse(
+        status_code=200 if all_loaded else 503,
+        content={
+            "status": "healthy" if all_loaded else "degraded",
+            "models": models_status,
+        },
+    )
 
 
 # Define a database dependency
@@ -519,6 +560,10 @@ async def clinical_score(
     return JSONResponse(content={
         "clinical_score": [[final_score]],
         "raw_score": result["raw_score"],
+        "lstm_score": result["lstm_score"],
+        "rf_score": result["rf_score"],
+        "ensemble_alpha": result["ensemble_alpha"],
+        "rf_available": result["rf_available"],
         "motion_detected": result["motion_detected"],
         "motion_energy": result["motion_energy"],
         "quality_factor": result["quality_factor"],
@@ -599,16 +644,17 @@ async def diagnostic_endpoint(exercise_id: str):
 
 @app.websocket("/ws/session/{exercise_id}")
 async def exercise_session_ws(websocket: WebSocket, exercise_id: str):
-    """Bidirectional WebSocket for real-time exercise feedback.
+    """WebSocket for clinical score prediction.
 
     Message types (client → server):
-      - {"type": "feedback", "referenceJointValues": [...], "currentJointValues": [...]}
       - {"type": "clinical_score", "csvString": "..."}
 
     Response types (server → client):
-      - {"type": "feedback", ...feedback_details...}
-      - {"type": "clinical_score", "score": float}
+      - {"type": "clinical_score", "score": float, "raw_score": float,
+         "motion_detected": bool, "motion_energy": float, "quality_factor": float}
       - {"type": "error", "message": str}
+
+    Note: Real-time feedback has been removed (low reliability with Spearman ρ < 0.3).
     """
     await websocket.accept()
     logger.info(f"WebSocket connected for exercise {exercise_id}")
@@ -620,25 +666,7 @@ async def exercise_session_ws(websocket: WebSocket, exercise_id: str):
             start_time = time.monotonic()
 
             try:
-                if msg_type == "feedback":
-                    ref_values = data.get("referenceJointValues", [])
-                    cur_values = data.get("currentJointValues", [])
-
-                    feedback = await run_in_threadpool(
-                        generate_feedback,
-                        exercise_id,
-                        ref_values,
-                        cur_values,
-                    )
-
-                    elapsed_ms = (time.monotonic() - start_time) * 1000
-                    await websocket.send_json({
-                        "type": "feedback",
-                        "latency_ms": round(elapsed_ms, 1),
-                        **feedback,
-                    })
-
-                elif msg_type == "clinical_score":
+                if msg_type == "clinical_score":
                     csv_string = data.get("csvString", "")
                     if not csv_string:
                         await websocket.send_json({
@@ -690,28 +718,6 @@ async def exercise_session_ws(websocket: WebSocket, exercise_id: str):
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for exercise {exercise_id}")
-
-
-# ---- Health Check ----
-
-
-@app.get("/api/health")
-async def health_check():
-    """Production health check — verifies models and scalers are loaded."""
-    models_status = {}
-    for ex_id in ["Es1", "Es2", "Es3", "Es4", "Es5"]:
-        models_status[ex_id] = {
-            "model_loaded": ex_id in ml_models_cache,
-            "error": model_load_errors.get(ex_id),
-        }
-    all_loaded = all(s["model_loaded"] for s in models_status.values())
-    return JSONResponse(
-        status_code=200 if all_loaded else 503,
-        content={
-            "status": "healthy" if all_loaded else "degraded",
-            "models": models_status,
-        },
-    )
 
 
 @app.post("/api/logout/")

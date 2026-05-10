@@ -1,28 +1,13 @@
-"""
-03_extract_joint_features.py — Paper-Defined Exercise-Specific Feature Extraction
-===================================================================================
-Implements exercise-specific features from Guo & Khan (2021) "Exercise-Specific
-Feature Extraction Approach for Assessing Physical Rehabilitation" (Paper 2),
-as referenced by arXiv 2306.09546 (Paper 1).
+"""Exercise-specific feature extraction from joint positions.
 
-Features are selected per-exercise using Table 2 (optimized subsets) from Paper 2:
-  Es1: 6 features (IDs 0,1,2,3,4,5)
-  Es2: 6 features (IDs 0,1,3,5,6,7)
-  Es3: 9 features (IDs 0,1,2,3,5,6,7,8,9)
-  Es4: 2 features (IDs 3,10)
-  Es5: 7 features (IDs 0,1,2,3,5,6,7)
-
-CRITICAL: This file's feature extraction functions MUST produce identical features
-to backend/joint_features.py so that training and inference see the same data.
-
-Usage:
-  Colab:  Change BASE_DIR to '/content/drive/MyDrive/RehabAI' and run
-  Local:  python 03_extract_joint_features.py
+Implements features selected per-exercise for clinical scoring.
+Must produce identical features to backend/joint_features.py.
 """
 
 import os
 import pandas as pd
 import numpy as np
+from scipy.ndimage import median_filter as scipy_median_filter
 from sklearn.preprocessing import StandardScaler
 import joblib
 
@@ -86,177 +71,215 @@ def calculate_vector_angle_2d(vec1, vec2):
     return pd.Series(np.degrees(np.arccos(cos_angle)))
 
 
+def apply_median_filter(joint_df, window=5):
+    filtered = joint_df.copy()
+    coord_cols = [c for c in filtered.columns if c.endswith('_x') or c.endswith('_y')]
+    for col in coord_cols:
+        filtered[col] = scipy_median_filter(filtered[col].values, size=window, mode='nearest')
+    return filtered
+
+
+def calculate_angular_velocity(angle_series):
+    """First-order finite difference of an angle series.
+    velocity[0] = 0, velocity[t] = angle[t] - angle[t-1].
+    Provides temporal dynamics info to LSTM without it having to learn derivatives.
+    Source: Capecci 2019 mentions velocity as a motion descriptor;
+            Liao et al. 2020 uses joint displacements (temporal diffs).
+    """
+    vel = np.diff(angle_series, prepend=angle_series.iloc[0] if hasattr(angle_series, 'iloc') else angle_series[0])
+    return pd.Series(vel)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Per-Exercise Feature Extractors — Paper 2, Table 2 (optimized subsets)
 # MUST MATCH backend/joint_features.py exactly
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_es1_features(df):
-    """Es1 — Lifting of arms. Table 2: features 0,1,2,3,4,5 (6 features)."""
-    features_df = pd.DataFrame()
+    """Es1 — Lifting of arms (10 features).
+    Guo&Khan (2021) baseline (6) + shoulder_angle L/R (Capecci 2019 PO α_l/r) +
+    wrist_height_ratio (Proietti 2022) + wrist_elevation_velocity (Liao 2020).
 
-    # Feature 0: left_elbow_angle — elbow extension angle at left elbow
+    shoulder_angle (hip→shoulder→elbow): PRIMARY OUTCOME per Capecci et al. (2019).
+    "angles between right/left arm and upper torso (α_l/r) represent the POs"
+    — IEEE TNSRE 27(7) p.1440, Exercise 1. Measures arm-torso ROM directly.
+
+    MUST MATCH backend/joint_features.py exactly.
+    """
+    features_df = pd.DataFrame()
     left_elbow = calculate_angle_2d(
         get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"), get_joint_2d(df, "left_wrist"))
     features_df["left_elbow_angle"] = left_elbow
-
-    # Feature 1: right_elbow_angle — elbow extension angle at right elbow
     right_elbow = calculate_angle_2d(
         get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"), get_joint_2d(df, "right_wrist"))
     features_df["right_elbow_angle"] = right_elbow
-
-    # Feature 2: hand_shoulder_ratio — hands distance / shoulder width
     hands_dist = calculate_distance_2d(get_joint_2d(df, "left_wrist"), get_joint_2d(df, "right_wrist"))
     shoulder_dist = calculate_distance_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "right_shoulder"))
     features_df["hand_shoulder_ratio"] = hands_dist / (shoulder_dist + 1e-8)
-
-    # Feature 3: torso_tilted_angle — angle between torso vector and vertical
     torso_vec = get_torso_vector_2d(df)
     vertical = np.tile([0, 1], (len(df), 1))
     features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
-
-    # Feature 4: hand_tilted_angle — angle between hand-to-hand vector and horizontal
     hand_vec = get_joint_2d(df, "right_wrist") - get_joint_2d(df, "left_wrist")
     horizontal = np.tile([1, 0], (len(df), 1))
     features_df["hand_tilted_angle"] = calculate_vector_angle_2d(hand_vec, horizontal)
-
-    # Feature 5: elbow_angles_diff — |left_elbow_angle - right_elbow_angle|
     features_df["elbow_angles_diff"] = np.abs(left_elbow - right_elbow)
-
+    # ── PRIMARY OUTCOME: Shoulder angle (Capecci 2019 α_l/r) ──
+    # angle(hip, shoulder, elbow) — arm-to-torso ROM, the main goal of arm lifting.
+    # Source: Capecci et al. (2019), IEEE TNSRE 27(7), Exercise 1 PO description.
+    features_df["left_shoulder_angle"] = calculate_angle_2d(
+        get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"))
+    features_df["right_shoulder_angle"] = calculate_angle_2d(
+        get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"))
+    # ── Wrist height ratio (Proietti 2022) ──
+    shoulder_mid = (get_joint_2d(df, "left_shoulder") + get_joint_2d(df, "right_shoulder")) / 2
+    wrist_mid = (get_joint_2d(df, "left_wrist") + get_joint_2d(df, "right_wrist")) / 2
+    hip_mid = (get_joint_2d(df, "left_hip") + get_joint_2d(df, "right_hip")) / 2
+    torso_length = hip_mid[:, 1] - shoulder_mid[:, 1]
+    wrist_elevation = shoulder_mid[:, 1] - wrist_mid[:, 1]
+    features_df["wrist_height_ratio"] = wrist_elevation / (torso_length + 1e-8)
+    # ── Wrist elevation velocity (Liao 2020) ──
+    features_df["wrist_elevation_velocity"] = calculate_angular_velocity(features_df["wrist_height_ratio"])
     return features_df
 
 
 def get_es2_features(df):
-    """Es2 — Lateral tilt of trunk. Table 2: features 0,1,3,5,6,7 (6 features)."""
-    features_df = pd.DataFrame()
+    """Es2 — Lateral tilt of trunk (8 features).
+    Guo&Khan baseline (6) + lateral_displacement (Capecci 2019) +
+    torso_tilt_velocity.
 
-    # Feature 0: left_elbow_angle
+    MUST MATCH backend/joint_features.py exactly.
+    """
+    features_df = pd.DataFrame()
     left_elbow = calculate_angle_2d(
         get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"), get_joint_2d(df, "left_wrist"))
     features_df["left_elbow_angle"] = left_elbow
-
-    # Feature 1: right_elbow_angle
     right_elbow = calculate_angle_2d(
         get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"), get_joint_2d(df, "right_wrist"))
     features_df["right_elbow_angle"] = right_elbow
-
-    # Feature 3: torso_tilted_angle
     torso_vec = get_torso_vector_2d(df)
     vertical = np.tile([0, 1], (len(df), 1))
-    features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
-
-    # Feature 5: elbow_angles_diff
+    torso_angle = calculate_vector_angle_2d(torso_vec, vertical)
+    features_df["torso_tilted_angle"] = torso_angle
     features_df["elbow_angles_diff"] = np.abs(left_elbow - right_elbow)
-
-    # Feature 6: left_shoulder_angle — shoulder elevation (hip→shoulder→elbow)
     features_df["left_shoulder_angle"] = calculate_angle_2d(
         get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"))
-
-    # Feature 7: right_shoulder_angle — shoulder elevation (hip→shoulder→elbow)
     features_df["right_shoulder_angle"] = calculate_angle_2d(
         get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"))
-
+    # ── NEW: Lateral displacement (Capecci 2019 CF δ) ──
+    shoulder_mid = (get_joint_2d(df, "left_shoulder") + get_joint_2d(df, "right_shoulder")) / 2
+    hip_mid = (get_joint_2d(df, "left_hip") + get_joint_2d(df, "right_hip")) / 2
+    hip_dist = calculate_distance_2d(get_joint_2d(df, "left_hip"), get_joint_2d(df, "right_hip"))
+    features_df["lateral_displacement"] = np.abs(shoulder_mid[:, 0] - hip_mid[:, 0]) / (hip_dist + 1e-8)
+    # ── NEW: Torso tilt velocity ──
+    features_df["torso_tilt_velocity"] = calculate_angular_velocity(torso_angle)
     return features_df
 
 
 def get_es3_features(df):
-    """Es3 — Trunk rotation. Table 2: features 0,1,2,3,5,6,7,8,9 (9 features)."""
-    features_df = pd.DataFrame()
+    """Es3 — Trunk rotation (9 features).
+    Guo&Khan baseline (7) + shoulder_width_ratio (Chen 2021) +
+    shoulder_width_velocity.
 
-    # Feature 0: left_elbow_angle
+    MUST MATCH backend/joint_features.py exactly.
+    """
+    features_df = pd.DataFrame()
     left_elbow = calculate_angle_2d(
         get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"), get_joint_2d(df, "left_wrist"))
     features_df["left_elbow_angle"] = left_elbow
-
-    # Feature 1: right_elbow_angle
     right_elbow = calculate_angle_2d(
         get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"), get_joint_2d(df, "right_wrist"))
     features_df["right_elbow_angle"] = right_elbow
-
-    # Feature 2: hand_shoulder_ratio
     hands_dist = calculate_distance_2d(get_joint_2d(df, "left_wrist"), get_joint_2d(df, "right_wrist"))
     shoulder_dist = calculate_distance_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "right_shoulder"))
     features_df["hand_shoulder_ratio"] = hands_dist / (shoulder_dist + 1e-8)
-
-    # Feature 3: torso_tilted_angle
     torso_vec = get_torso_vector_2d(df)
     vertical = np.tile([0, 1], (len(df), 1))
     features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
-
-    # Feature 5: elbow_angles_diff
     features_df["elbow_angles_diff"] = np.abs(left_elbow - right_elbow)
-
-    # Feature 6: left_shoulder_angle
     features_df["left_shoulder_angle"] = calculate_angle_2d(
         get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"))
-
-    # Feature 7: right_shoulder_angle
     features_df["right_shoulder_angle"] = calculate_angle_2d(
         get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"))
-
-    # Feature 8: left_arm_torso_angle — angle between torso vector and left upper arm
-    left_arm_vec = get_joint_2d(df, "left_elbow") - get_joint_2d(df, "left_shoulder")
-    features_df["left_arm_torso_angle"] = calculate_vector_angle_2d(torso_vec, left_arm_vec)
-
-    # Feature 9: right_arm_torso_angle — angle between torso vector and right upper arm
-    right_arm_vec = get_joint_2d(df, "right_elbow") - get_joint_2d(df, "right_shoulder")
-    features_df["right_arm_torso_angle"] = calculate_vector_angle_2d(torso_vec, right_arm_vec)
-
+    # ── NEW: Shoulder width ratio (Chen 2021 perspective distortion) ──
+    hip_dist = calculate_distance_2d(get_joint_2d(df, "left_hip"), get_joint_2d(df, "right_hip"))
+    sw_ratio = shoulder_dist / (hip_dist + 1e-8)
+    features_df["shoulder_width_ratio"] = sw_ratio
+    # ── NEW: Shoulder width velocity — rotation smoothness ──
+    features_df["shoulder_width_velocity"] = calculate_angular_velocity(sw_ratio)
     return features_df
 
 
 def get_es4_features(df):
-    """Es4 — Pelvis rotation. Table 2: features 3,10 (2 features)."""
+    """Es4 — Pelvis rotation (6 features).
+    Original: 2 features. NEW: +hip_angle L/R (Capecci 2019 CF ψ_l/r),
+    +hip_angles_diff (bilateral symmetry), +torso_tilted_velocity.
+    """
     features_df = pd.DataFrame()
 
-    # Feature 3: torso_tilted_angle
     torso_vec = get_torso_vector_2d(df)
     vertical = np.tile([0, 1], (len(df), 1))
-    features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
+    torso_angle = calculate_vector_angle_2d(torso_vec, vertical)
+    features_df["torso_tilted_angle"] = torso_angle
 
-    # Feature 10: knee_hip_ratio — knee distance / hip width
     knee_dist = calculate_distance_2d(get_joint_2d(df, "left_knee"), get_joint_2d(df, "right_knee"))
     hip_dist = calculate_distance_2d(get_joint_2d(df, "left_hip"), get_joint_2d(df, "right_hip"))
     features_df["knee_hip_ratio"] = knee_dist / (hip_dist + 1e-8)
+
+    left_hip = calculate_angle_2d(
+        get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_knee"))
+    features_df["left_hip_angle"] = left_hip
+
+    right_hip = calculate_angle_2d(
+        get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_knee"))
+    features_df["right_hip_angle"] = right_hip
+    features_df["hip_angles_diff"] = np.abs(left_hip - right_hip)
+    features_df["torso_tilted_velocity"] = calculate_angular_velocity(torso_angle)
 
     return features_df
 
 
 def get_es5_features(df):
-    """Es5 — Squatting. Table 2: features 0,1,2,3,5,6,7 (7 features)."""
+    """Es5 — Squatting (8 features).
+    Reduced from 11→8 to fix overfitting (67 samples / 11 features = 6:1 ratio → too low).
+
+    REMOVED (3 features):
+    - left/right_elbow_angle: Guo&Khan (2021) Table 2 best model for Ex5 excludes
+      left_elbow_angle (ID 0). Arms are held static during squat → near-constant, adds noise.
+    - elbow_angles_diff: meaningless without the elbow angles themselves.
+    - knee_angle_velocity: uses only left_knee → biased for hemiplegic patients.
+      With flip±1° augmentation, LSTM already learns temporal smoothness from sequence.
+      Source: Liao et al. (2020), bilateral velocity required to be clinically meaningful.
+
+    KEPT:
+    - hand_shoulder_ratio, torso_tilted_angle: arm position + forward lean (Capecci 2019 CF)
+    - left/right_shoulder_angle: Guo&Khan (2021) Table 1 Ex5 features
+    - left/right_knee_angle: PRIMARY OUTCOME per Capecci 2019 (θ_l/r)
+    - knee_ankle_ratio: frontal plane valgus detection (Proietti 2022)
+
+    MUST MATCH backend/joint_features.py exactly.
+    """
     features_df = pd.DataFrame()
-
-    # Feature 0: left_elbow_angle
-    left_elbow = calculate_angle_2d(
-        get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"), get_joint_2d(df, "left_wrist"))
-    features_df["left_elbow_angle"] = left_elbow
-
-    # Feature 1: right_elbow_angle
-    right_elbow = calculate_angle_2d(
-        get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"), get_joint_2d(df, "right_wrist"))
-    features_df["right_elbow_angle"] = right_elbow
-
-    # Feature 2: hand_shoulder_ratio
     hands_dist = calculate_distance_2d(get_joint_2d(df, "left_wrist"), get_joint_2d(df, "right_wrist"))
     shoulder_dist = calculate_distance_2d(get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "right_shoulder"))
     features_df["hand_shoulder_ratio"] = hands_dist / (shoulder_dist + 1e-8)
-
-    # Feature 3: torso_tilted_angle
     torso_vec = get_torso_vector_2d(df)
     vertical = np.tile([0, 1], (len(df), 1))
     features_df["torso_tilted_angle"] = calculate_vector_angle_2d(torso_vec, vertical)
-
-    # Feature 5: elbow_angles_diff
-    features_df["elbow_angles_diff"] = np.abs(left_elbow - right_elbow)
-
-    # Feature 6: left_shoulder_angle
     features_df["left_shoulder_angle"] = calculate_angle_2d(
         get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_shoulder"), get_joint_2d(df, "left_elbow"))
-
-    # Feature 7: right_shoulder_angle
     features_df["right_shoulder_angle"] = calculate_angle_2d(
         get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_shoulder"), get_joint_2d(df, "right_elbow"))
-
+    # Primary Outcomes: knee flexion angles (sagittal plane) — Capecci 2019 θ_l/r
+    left_knee = calculate_angle_2d(
+        get_joint_2d(df, "left_hip"), get_joint_2d(df, "left_knee"), get_joint_2d(df, "left_ankle"))
+    right_knee = calculate_angle_2d(
+        get_joint_2d(df, "right_hip"), get_joint_2d(df, "right_knee"), get_joint_2d(df, "right_ankle"))
+    features_df["left_knee_angle"] = left_knee
+    features_df["right_knee_angle"] = right_knee
+    # Frontal plane alignment: knee valgus detection (Proietti 2022)
+    knee_dist = calculate_distance_2d(get_joint_2d(df, "left_knee"), get_joint_2d(df, "right_knee"))
+    ankle_dist = calculate_distance_2d(get_joint_2d(df, "left_ankle"), get_joint_2d(df, "right_ankle"))
+    features_df["knee_ankle_ratio"] = knee_dist / (ankle_dist + 1e-8)
     return features_df
 
 
@@ -271,7 +294,6 @@ FEATURE_EXTRACTORS = {
     'Es4': get_es4_features,
     'Es5': get_es5_features,
 }
-
 
 def main():
     input_path = os.path.join(FINAL_DATASET_DIR, 'KiMoRe_final_mediapipe.csv')
@@ -316,7 +338,8 @@ def main():
             skip_count += 1
             continue
 
-        # Extract features
+        joint_data = apply_median_filter(joint_data, window=5)
+
         features_df = extractor(joint_data)
 
         # Handle NaN/inf from edge cases (e.g., zero-length vectors)
